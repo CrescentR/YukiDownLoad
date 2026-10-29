@@ -69,6 +69,7 @@ cookies
 # Python
 *.pyc
 *.pyo
+__pycache__/
 .*_cache
 wine-py2exe/
 py2exe.log
@@ -132,6 +133,12 @@ yt-dlp.zip
 # Plugins
 ytdlp_plugins/
 yt-dlp-plugins
+# Ship the application's compatibility plugin while ignoring downloaded plugins.
+!/gui/src-tauri/resources/yt-dlp-plugins/
+!/gui/src-tauri/resources/yt-dlp-plugins/douyin-compat/
+!/gui/src-tauri/resources/yt-dlp-plugins/douyin-compat/yt_dlp_plugins/
+!/gui/src-tauri/resources/yt-dlp-plugins/douyin-compat/yt_dlp_plugins/extractor/
+!/gui/src-tauri/resources/yt-dlp-plugins/douyin-compat/yt_dlp_plugins/extractor/yuki_douyin.py
 
 # Packages
 yt_dlp_ejs/

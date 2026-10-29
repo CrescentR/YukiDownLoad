@@ -5,15 +5,16 @@
  * list re-render freely without leaking listeners or losing handlers.
  */
 
-import { findUrl, splitUrls, storage } from "../core/util.js";
+import { detectPlatform, findUrl, findUrls, storage } from "../core/util.js";
 import { setLanguage, t } from "../core/i18n.js";
 import { call, isDesktop, pickDirectory, pickFile } from "../core/api.js";
 import { toast } from "./toasts.js";
 import * as settings from "./settings.js";
-import { render, getRoot } from "./shell.js";
+import { render, getRoot, libraryTasks } from "./shell.js";
 
 let store = null;
 let refresh = null;
+let analyzeSeq = 0;
 
 /** Injected by main.js to avoid a circular import. */
 export function configure({ store: appStore, refreshTasks }) {
@@ -35,9 +36,7 @@ function urlInput() {
 function currentUrls() {
   const input = urlInput();
   if (!input) return [];
-  return splitUrls(input.value)
-    .map((line) => findUrl(line))
-    .filter(Boolean);
+  return findUrls(input.value);
 }
 
 function trimHistory() {
@@ -48,15 +47,16 @@ function trimHistory() {
 }
 
 export function patchHistoryHint() {
-  const platform = document.querySelector('[data-platform]');
+  const input = urlInput();
+  const raw = input?.value || "";
+  const multiline = raw.includes("\n");
+  input?.closest(".composer")?.classList.toggle("multiline", multiline);
+  if (input && input.tagName === "TEXTAREA") {
+    input.rows = multiline ? Math.min(3, raw.split(/\r?\n/).length) : 1;
+  }
+  const platform = document.querySelector("[data-platform]");
   if (platform) {
-    const url = findUrl(urlInput()?.value || '');
-    let host = '';
-    try { host = new URL(url).hostname.replace(/^www\./, ''); } catch {}
-    const name = /(^|\.)youtube\.com$|youtu\.be$/.test(host) ? 'YouTube'
-      : /(^|\.)bilibili\.com$|b23\.tv$/.test(host) ? 'Bilibili'
-      : /(^|\.)vimeo\.com$/.test(host) ? 'Vimeo'
-      : /(^|\.)(x|twitter)\.com$/.test(host) ? 'X' : host;
+    const name = detectPlatform(findUrl(raw));
     platform.hidden = !name;
     platform.textContent = name;
   }
@@ -77,7 +77,7 @@ function basePayload(overrides = {}) {
     outputTemplate: appState.settings.outputTemplate || "",
     playlistMode: appState.settings.playlistMode === "all" ? "playlist" : appState.settings.playlistMode === "single" ? "single" : "auto",
     playlistItems: appState.settings.playlistItems || "",
-    audioFormat: appState.commandQuality === 'audio' ? 'flac' : appState.settings.audioFormat || "mp3",
+    audioFormat: appState.settings.audioFormat || "mp3",
     embedMetadata: appState.settings.embedMetadata,
     embedThumbnail: appState.parserOptions?.embedThumbnail ?? appState.settings.embedThumbnail,
     writeSubtitles: appState.parserOptions?.embedSubtitles ?? false,
@@ -138,6 +138,15 @@ async function changeTaskState(command, id) {
   catch (error) { toast(String(error), 'error'); }
 }
 
+function dismissPreview() {
+  analyzeSeq += 1;
+  const wasAnalyzing = state().analyzing;
+  patch({ parserOpen: false, analyzing: false });
+  if (wasAnalyzing) {
+    void call("cancel_analyze").catch(() => {});
+  }
+}
+
 async function analyzeCurrent() {
   if (state().analyzing) return;
   const input = urlInput();
@@ -149,11 +158,19 @@ async function analyzeCurrent() {
     return;
   }
 
+  const seq = ++analyzeSeq;
+  const playlistMode = state().settings.playlistMode;
+  const isPurePlaylist =
+    /\/playlist\b/i.test(url) ||
+    (/[?&]list=/i.test(url) && !/[?&]v=/i.test(url) && !/youtu\.be\//i.test(url));
+  const shallow = playlistMode !== "single" && isPurePlaylist;
+
   patch({ analyzing: true, probeError: null, parserOpen: true });
   render(state());
 
   try {
-    const probe = await call("analyze_url", { url, shallow: false });
+    const probe = await call("analyze_url", { url, shallow, language: state().language });
+    if (seq !== analyzeSeq || !state().parserOpen) return;
     // Preselect the recommended format so Download works without a click.
     const preferredAudio = state().commandQuality === 'audio' ? probe?.formats?.find(format=>format.kind==='audio') : null;
     const recommended = preferredAudio || probe?.formats?.find((format) => format.recommended) || probe?.formats?.[0];
@@ -166,6 +183,7 @@ async function analyzeCurrent() {
     if (!probe?.ok) toast(probe?.error || t("analyzingFailed"), "error", 6000);
     else toast(t("toastAnalyzed"), "success", 2000);
   } catch (error) {
+    if (seq !== analyzeSeq || !state().parserOpen) return;
     patch({ analyzing: false, probe: { ok: false, error: String(error), log: [] } });
     toast(String(error), "error");
   }
@@ -192,7 +210,9 @@ async function downloadCurrent() {
   // An explicit format choice from the analysis panel wins over the preset.
   if (matchesProbe && appState.selectedFormatId) {
     const chosen = probe.formats?.find((format) => format.id === appState.selectedFormatId);
-    overrides.formatId = chosen?.kind === 'video' ? `${appState.selectedFormatId}+ba/b` : appState.selectedFormatId;
+    overrides.formatId = chosen?.kind === "video"
+      ? `${appState.selectedFormatId}+ba[protocol!*=m3u8]/${appState.selectedFormatId}+ba/b`
+      : appState.selectedFormatId;
     overrides.quality = chosen?.kind === "audio" ? "audio" : "best";
   }
 
@@ -216,20 +236,26 @@ function selectFormat(formatId) {
   // position inside a long format list is preserved.
   const root = getRoot();
   root?.querySelectorAll("[data-action='select-format']").forEach((card) => {
-    card.classList.toggle("selected", card.dataset.formatId === formatId);
+    const selected = card.dataset.formatId === formatId;
+    card.classList.toggle("selected", selected);
+    card.setAttribute("aria-pressed", String(selected));
   });
 }
 
 async function downloadPlaylist(playlistMode) {
-  const probe = state().probe;
+  const appState = state();
+  const probe = appState.probe;
+  const urls = currentUrls();
   const payload = basePayload({
+    urls: urls.length ? urls : appState.probeUrl ? [appState.probeUrl] : [],
     playlistMode,
     title: probe?.title || "",
     thumbnail: probe?.thumbnail || "",
   });
   const task = await submit(payload);
   if (task) {
-    patch({ probe: null, probeUrl: null, tab: "queue" });
+    trimHistory();
+    patch({ probe: null, probeUrl: null, parserOpen: false, selectedFormatId: "", tab: "queue", taskFilter: "all" });
     render(state());
   }
 }
@@ -239,9 +265,10 @@ async function pasteFromClipboard() {
     const text = await navigator.clipboard.readText();
     const input = urlInput();
     if (!input) return;
-    const url = findUrl(text) || text.trim();
-    if (!url) return;
-    input.value = input.value.trim() ? `${input.value.trim()}\n${url}` : url;
+    const urls = findUrls(text);
+    const addition = urls.length ? urls.join("\n") : text.trim();
+    if (!addition) return;
+    input.value = input.value.trim() ? `${input.value.trim()}\n${addition}` : addition;
     patchHistoryHint();
     input.focus();
   } catch {
@@ -288,7 +315,12 @@ async function saveSettings() {
   try {
     const { cookieText = "", cookieSite = "bilibili", ...value } = draft;
     const saved = await call("save_settings", { value, cookieText, cookieSite });
-    patch({ settings: saved, settingsSaving: false, settingsOpen: false });
+    patch({
+      settings: saved,
+      commandQuality: saved.quality || "best",
+      settingsSaving: false,
+      settingsOpen: false,
+    });
     settings.closeSettings();
     applyTheme(saved.theme);
     if (saved.language === "zh" || saved.language === "en") setLanguage(saved.language);
@@ -305,7 +337,7 @@ async function resetSettings() {
   try {
     // An empty object is filled in by the backend's defaults.
     const saved = await call("save_settings", { value: { outputDir: "", outputTemplate: "", quality: "" } });
-    patch({ settings: saved });
+    patch({ settings: saved, commandQuality: saved.quality || "best" });
     settings.openSettings({ ...state(), settings: saved });
     applyTheme(saved.theme);
     toast(t("saved"), "success");
@@ -326,9 +358,22 @@ async function cancelTask(id) {
 }
 
 async function removeTask(id) {
-  if (!isDesktop()) { patch({tasks:state().tasks.filter(task=>task.id!==id)});render(state());return; }
+  if (!isDesktop()) {
+    patch({
+      tasks: state().tasks.filter((task) => task.id !== id),
+      history: (state().history || []).filter((item) => item.id !== id),
+    });
+    render(state());
+    return;
+  }
   try {
-    await call("remove_task", { id });
+    const inLiveQueue = state().tasks.some((task) => task.id === id);
+    if (inLiveQueue) {
+      await call("remove_task", { id });
+    } else {
+      await call("remove_history", { id });
+      patch({ history: (state().history || []).filter((item) => item.id !== id) });
+    }
     if (state().drawerTaskId === id) patch({ drawerTaskId: null });
     toast(t("toastRemoved"));
   } catch (error) {
@@ -351,7 +396,7 @@ async function retryTask(id) {
 }
 
 async function revealTask(id) {
-  const task = state().tasks.find((item) => item.id === id);
+  const task = libraryTasks(state()).find((item) => item.id === id);
   if (!task) return;
   const target = task.destination || task.outputDir;
   if (!target) {
@@ -366,9 +411,20 @@ async function revealTask(id) {
 }
 
 async function clearFinished() {
-  if (!isDesktop()) { patch({tasks:state().tasks.filter(task=>!['completed','failed','canceled'].includes(task.status))});render(state());return; }
+  if (!isDesktop()) {
+    patch({
+      tasks: state().tasks.filter((task) => !["completed", "failed", "canceled"].includes(task.status)),
+      history: state().tab === "queue" ? state().history : [],
+    });
+    render(state());
+    return;
+  }
   try {
     await call("clear_finished");
+    if (state().tab !== "queue" && state().history?.length) {
+      await call("clear_history");
+      patch({ history: [] });
+    }
     await refresh();
     toast(t("toastCleared"));
   } catch (error) {
@@ -552,7 +608,7 @@ const HANDLERS = {
   paste: () => pasteFromClipboard(),
   "select-format": (_event, target) => selectFormat(target.dataset.formatId),
   "dismiss-preview": () => {
-    patch({ parserOpen: false });
+    dismissPreview();
     render(state());
   },
   "use-entry": (_event, target) => {
@@ -566,10 +622,11 @@ const HANDLERS = {
     }
   },
   "open-cookie-settings": () => {
-    settings.openSettings(state(), "network");
     const url = state().probeUrl || urlInput()?.value || '';
+    dismissPreview();
+    settings.openSettings(state(), "network");
     if (/https?:\/\/(?:[\w-]+\.)*douyin\.com(?:[/:]|$)/i.test(url)) settings.setDraftValue('cookieSite', 'douyin');
-    patch({ settingsOpen: true, parserOpen: false });
+    patch({ settingsOpen: true });
     render(state());
   },
   "open-settings": () => {
@@ -590,7 +647,12 @@ const HANDLERS = {
     render(state());
   },
   "settings-tab": (_event, target) => {
-    settings.setActiveSection(target.dataset.tab);
+    if (!state().settingsOpen) {
+      settings.openSettings(state(), target.dataset.tab);
+      patch({ settingsOpen: true });
+    } else {
+      settings.setActiveSection(target.dataset.tab);
+    }
     render(state());
   },
   "toggle-setting": (_event, target) => {
@@ -640,7 +702,7 @@ const HANDLERS = {
   retry: (_event, target) => retryTask(target.dataset.id),
   reveal: (_event, target) => revealTask(target.dataset.id),
   "copy-command": (_event, target) => {
-    const task = state().tasks.find((item) => item.id === target.dataset.id);
+    const task = libraryTasks(state()).find((item) => item.id === target.dataset.id);
     copyText((task?.command || []).join(" "), t("copied"));
   },
   "toggle-theme": () => toggleTheme(),
@@ -684,24 +746,45 @@ export function installActions(root) {
   });
 
   root.addEventListener("keydown", (event) => {
-    if ((event.ctrlKey || event.metaKey) && event.key === ',') {
-      event.preventDefault(); settings.openSettings(state()); patch({settingsOpen:true,parserOpen:false});render(state());return;
+    if ((event.ctrlKey || event.metaKey) && event.key === ",") {
+      event.preventDefault();
+      dismissPreview();
+      settings.openSettings(state());
+      patch({ settingsOpen: true });
+      render(state());
+      return;
     }
-    const dialog = document.querySelector('.parser-dialog, [data-settings-host]:not([hidden]) .modal');
-    if (dialog && event.key === 'Tab') {
-      const controls = [...dialog.querySelectorAll('button:not(:disabled), input, select, [tabindex="0"]')].filter(node=>node.getClientRects().length);
-      const first=controls[0],last=controls.at(-1);
-      if (event.shiftKey && document.activeElement===first) { event.preventDefault();last?.focus(); }
-      else if (!event.shiftKey && document.activeElement===last) { event.preventDefault();first?.focus(); }
+    const dialog = document.querySelector(".parser-dialog, [data-settings-host]:not([hidden]) .modal");
+    if (dialog && event.key === "Tab") {
+      const controls = [
+        ...dialog.querySelectorAll('button:not(:disabled), input, select, textarea, [tabindex="0"]'),
+      ].filter((node) => node.getClientRects().length);
+      const first = controls[0];
+      const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
     }
     if (event.key === "Enter" && event.target === urlInput()) {
-      if (event.ctrlKey || event.metaKey) return;
-      event.preventDefault();
-      downloadCurrent();
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+        analyzeCurrent();
+        return;
+      }
+      if (!event.shiftKey) {
+        event.preventDefault();
+        downloadCurrent();
+      }
+      return;
     }
     if (event.key === "Escape") {
       if (state().parserOpen) {
-        patch({parserOpen:false}); render(state());
+        dismissPreview();
+        render(state());
       } else if (state().drawerTaskId) {
         patch({ drawerTaskId: null });
         render(state());
@@ -710,14 +793,6 @@ export function installActions(root) {
         patch({ settingsOpen: false });
         render(state());
       }
-    }
-  });
-
-  // Ctrl/Cmd+Enter analyzes, matching the common "preview first" flow.
-  root.addEventListener("keydown", (event) => {
-    if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && event.target === urlInput()) {
-      event.preventDefault();
-      analyzeCurrent();
     }
   });
 }

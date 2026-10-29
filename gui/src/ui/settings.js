@@ -23,6 +23,8 @@ const BROWSERS = [
 ];
 
 const QUALITY_OPTIONS = [
+  { value: "2160", key: "quality2160" },
+  { value: "1080p60", key: "quality1080p60" },
   { value: "best", key: "qualityBest" },
   { value: "1080", key: "quality1080" },
   { value: "720", key: "quality720" },

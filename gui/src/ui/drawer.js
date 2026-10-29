@@ -34,15 +34,15 @@ function row(label, value) {
 
 function bodyMarkup(task) {
   const meta = [
-    row("Status", t(STATUS_KEY[task.status] || "statusQueued")),
-    row("Quality", task.quality),
-    row("Folder", task.outputDir),
-    row("File", task.destination),
-    row("URL", task.urls?.[0]),
-    task.totalBytes ? row("Size", formatBytes(task.totalBytes)) : "",
-    task.speed ? row("Speed", formatSpeed(task.speed)) : "",
-    task.eta ? row("ETA", formatEta(task.eta)) : "",
-    task.exitCode !== null && task.exitCode !== undefined ? row("Exit code", task.exitCode) : "",
+    row(t("metaStatus"), t(STATUS_KEY[task.status] || "statusQueued")),
+    row(t("metaQuality"), task.quality),
+    row(t("metaFolder"), task.outputDir),
+    row(t("metaFile"), task.destination),
+    row(t("metaUrl"), task.urls?.[0]),
+    task.totalBytes ? row(t("metaSize"), formatBytes(task.totalBytes)) : "",
+    task.speed ? row(t("metaSpeed"), formatSpeed(task.speed)) : "",
+    task.eta ? row(t("metaEta"), formatEta(task.eta)) : "",
+    task.exitCode !== null && task.exitCode !== undefined ? row(t("metaExitCode"), task.exitCode) : "",
   ]
     .filter(Boolean)
     .join("");
@@ -153,11 +153,11 @@ function appendLogs(view, task) {
   if (follow) view.scrollTop = view.scrollHeight;
 }
 
-export function patchDrawer(state) {
+export function patchDrawer(state, allTasks = state.tasks) {
   const host = $("[data-drawer-host]");
   if (!host) return;
 
-  const task = state.tasks.find((item) => item.id === state.drawerTaskId);
+  const task = allTasks.find((item) => item.id === state.drawerTaskId);
   if (!task) {
     if (host.dataset.sig) {
       host.dataset.sig = "";

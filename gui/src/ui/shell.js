@@ -46,9 +46,9 @@ function mainMarkup() {
     <header class="command-header"><div class="command-caption"><span data-i18n="commandCaption">${t('commandCaption')}</span><span class="shortcut" data-i18n="pasteShortcut">${t('pasteShortcut')}</span></div>
       <div class="topbar"><div class="composer rounded-md">
         ${icon('link',{size:15})}<span class="platform-tag" data-platform hidden></span>
-        <input type="text" data-url-input spellcheck="false" autocomplete="off" aria-label="${t('urlLabel')}" placeholder="${t('urlPlaceholder')}" />
+        <textarea rows="1" data-url-input spellcheck="false" autocomplete="off" aria-label="${t('urlLabel')}" placeholder="${t('urlPlaceholder')}"></textarea>
         <span class="batch-hint" data-batch-hint hidden></span>
-        <select class="quality-preset" data-quality-preset aria-label="${t('defaultQuality')}"><option value="2160">4K UHD</option><option value="1080p60">1080p60</option><option value="best">${t('qualityBest')}</option><option value="audio">Audio FLAC</option></select>
+        <select class="quality-preset" data-quality-preset aria-label="${t('defaultQuality')}"><option value="2160">4K UHD</option><option value="1080p60">1080p60</option><option value="best">${t('qualityBest')}</option><option value="1080">1080p</option><option value="720">720p</option><option value="480">480p</option><option value="worst">${t('qualityWorst')}</option><option value="audio">${t('qualityAudio')}</option></select>
         <button class="btn ghost sm" data-action="paste" title="${t('paste')}">${icon('clipboard',{size:13})}<span data-i18n="paste">${t('paste')}</span></button>
       </div><button class="btn outline" data-action="analyze">${icon('search',{size:14})}<span data-analyze-label>${t('analyze')}</span></button><button class="btn primary" data-action="download">${icon('arrow-down-to-line',{size:14})}<span data-i18n="download">${t('download')}</span></button></div>
     </header>
@@ -73,26 +73,70 @@ export function rerenderStatic(state) {
   $('[data-lang-label]').textContent=state.language==='zh'?'English':'中文';
   $('[data-theme-label]').textContent=state.theme==='dark'?t('themeLight'):t('themeDark');
   document.querySelectorAll('[data-action="task-filter"]').forEach(button=>{const active=button.dataset.value===(state.taskFilter||'all');button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active));});
-  const select=$('[data-quality-preset]'); if(select && select!==document.activeElement)select.value=state.commandQuality||state.settings.quality||'best';
-  if(select)select.querySelector('[value="best"]').textContent=t('qualityBest');
+  const select=$('[data-quality-preset]');
+  if(select){
+    select.setAttribute('aria-label',t('defaultQuality'));
+    select.querySelector('[value="best"]').textContent=t('qualityBest');
+    select.querySelector('[value="worst"]').textContent=t('qualityWorst');
+    select.querySelector('[value="audio"]').textContent=t('qualityAudio');
+    if(select!==document.activeElement)select.value=state.commandQuality||state.settings.quality||'best';
+  }
   for(const [action,key] of [['minimize','minimize'],['maximize','maximize'],['close','close']]) {
     $(`[data-action="window-${action}"]`)?.setAttribute('aria-label',t(key));
   }
   const max=$('.window-controls [data-action="window-maximize"]'); max?.setAttribute('aria-label',t('maximize'));
 }
+function historyToTask(item) {
+  const size = Number(item.size) || null;
+  return {
+    id: item.id,
+    urls: item.url ? [item.url] : [],
+    title: item.title || item.url || "—",
+    status: "completed",
+    quality: item.quality || "best",
+    outputDir: item.outputDir || "",
+    destination: item.destination || null,
+    thumbnail: item.thumbnail || null,
+    duration: item.duration ?? null,
+    progress: 100,
+    downloadedBytes: size,
+    totalBytes: size,
+    speed: null,
+    eta: null,
+    error: null,
+    exitCode: 0,
+    createdAt: item.finishedAt || 0,
+    finishedAt: item.finishedAt || null,
+    command: [],
+    logs: [],
+    droppedLogs: 0,
+    fromHistory: true,
+  };
+}
+export function libraryTasks(state) {
+  const seen = new Set(state.tasks.map((task) => task.id));
+  const persisted = (state.history || [])
+    .filter((item) => item?.id && !seen.has(item.id))
+    .map(historyToTask);
+  return [...state.tasks, ...persisted];
+}
 export function patchNav(state) {
-  const counts={queue:state.tasks.filter(task=>!['completed','canceled'].includes(task.status)).length,library:state.tasks.length,completed:state.tasks.filter(task=>task.status==='completed').length};
+  const allLibrary = libraryTasks(state);
+  const counts={queue:state.tasks.filter(task=>!['completed','canceled'].includes(task.status)).length,library:allLibrary.length,completed:allLibrary.filter(task=>task.status==='completed').length};
   document.querySelectorAll('[data-nav] .nav-item').forEach(button=>{button.classList.toggle('active',state.tab===button.dataset.tab);button.querySelector('.nav-count').textContent=counts[button.dataset.tab];});
 }
 export function visibleTasks(state) {
-  let tasks=state.tab==='completed'?state.tasks.filter(task=>task.status==='completed'):state.tasks;
+  const pool = state.tab === 'queue' ? state.tasks : libraryTasks(state);
+  let tasks = state.tab === 'completed' ? pool.filter(task => task.status === 'completed') : pool;
   if(state.tab!=='completed' && state.taskFilter && state.taskFilter!=='all')tasks=tasks.filter(task=>state.taskFilter==='running'?['running','merging','pausing'].includes(task.status):task.status===state.taskFilter);
   return tasks;
 }
 export function patchSectionHead(state) {
   $('[data-section-title]').textContent=t(state.tab==='completed'?'completedTitle':state.tab==='library'?'libraryTitle':'queueTitle');
   $('[data-section-meta]').textContent=String(visibleTasks(state).length).padStart(2,'0');
-  $('[data-clear-button]').hidden=!state.tasks.some(task=>['completed','failed','canceled'].includes(task.status));
+  const hasFinishedTasks = state.tasks.some(task=>['completed','failed','canceled'].includes(task.status));
+  const hasHistory = state.tab !== 'queue' && Array.isArray(state.history) && state.history.length > 0;
+  $('[data-clear-button]').hidden=!(hasFinishedTasks || hasHistory);
 }
 export function patchStatusBar(state) {
   const path=$('[data-path]'); path.textContent=state.settings.outputDir||'—';path.parentElement.title=state.settings.outputDir||'';
@@ -147,7 +191,7 @@ export function patchDeps(state) {
         <p>${t("ffmpegMissingHint")}</p>
         <div class="dep-actions">
           <button class="btn sm outline" type="button" data-action="recheck-ffmpeg">${t("ffmpegRecheck")}</button>
-          <button class="btn sm primary" type="button" data-action="settings-tab" data-tab="deps">${
+          <button class="btn sm primary" type="button" data-action="open-runtime">${
             ffmpeg.installSupported ? t("ffmpegInstall") : t("ffmpegManual")
           }</button>
         </div>
@@ -159,6 +203,7 @@ export function patchDeps(state) {
 
 export function render(state) {
   rerenderStatic(state); patchNav(state); patchPreview(state); patchSectionHead(state);
-  patchTaskList(state,visibleTasks(state)); patchStatusBar(state); patchDeps(state); patchDrawer(state); patchSettings(state);
+  const allTasks = libraryTasks(state);
+  patchTaskList(state,visibleTasks(state)); patchStatusBar(state); patchDeps(state); patchDrawer(state, allTasks); patchSettings(state);
 }
 export {visibleTasks as getVisibleTasks};

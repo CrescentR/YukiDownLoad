@@ -19,13 +19,10 @@ use std::{
     path::Path,
     process::Child,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-/// How long the analysis step may run before we give up.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(150);
 /// Completed downloads kept in the persistent library.
 const HISTORY_LIMIT: usize = 300;
 
@@ -49,7 +46,7 @@ pub struct QueuedTask {
 
 fn js_runtime_for(settings: &settings::Settings) -> Option<String> {
     if settings.use_js_runtime {
-        runtime::detect_js_runtime()
+        runtime::detect_js_runtime_cached()
     } else {
         None
     }
@@ -107,6 +104,7 @@ fn make_snapshot(id: &str, payload: &DownloadPayload, output_dir: &str) -> TaskS
         command: Vec::new(),
         logs: Vec::new(),
         dropped_logs: 0,
+        logs_omitted: false,
     }
 }
 
@@ -154,6 +152,8 @@ fn enqueue(
         state.tasks.insert(id.clone(), snapshot.clone());
         state.payloads.insert(id.clone(), payload.clone());
         if state.active < settings.max_concurrent_downloads.max(1) as usize {
+            // Reserve the concurrency slot atomically before releasing the lock.
+            state.active += 1;
             true
         } else {
             state.pending.push_back(QueuedTask {
@@ -164,20 +164,30 @@ fn enqueue(
         }
     };
 
+    manager.emit_task(&snapshot);
     if start_now {
-        spawn_task(manager.clone(), id.clone(), payload);
-    } else {
-        manager.emit_task(&snapshot);
+        let mgr = manager.clone();
+        let task_id = id.clone();
+        std::thread::spawn(move || spawn_task(mgr, task_id, payload));
     }
 
     Ok(manager.snapshot(&id).unwrap_or(snapshot))
 }
 
 /// Spawn a task's process and start supervising it.
+///
+/// The caller must already have reserved one `state.active` slot for `id`.
 fn spawn_task(manager: Arc<DownloadManager>, id: String, payload: DownloadPayload) {
     let app = manager.app.clone();
     let settings = settings::load(&app);
     let js_runtime = js_runtime_for(&settings);
+
+    let initial_seq = manager
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.tasks.get(&id).and_then(|task| task.logs.last().map(|line| line.seq)))
+        .unwrap_or(0);
 
     let (spawned, command) = match download::spawn(
         &payload,
@@ -188,30 +198,55 @@ fn spawn_task(manager: Arc<DownloadManager>, id: String, payload: DownloadPayloa
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
+            if let Ok(mut state) = manager.state.lock() {
+                state.active = state.active.saturating_sub(1);
+            }
             manager.update(&id, |task| {
                 task.status = "failed".into();
                 task.error = Some(error);
                 task.ended_at = Some(download::now());
             });
-            finish_task(manager, id);
+            schedule_pending(manager);
             return;
         }
     };
 
-    {
+    let started_snapshot = {
         let mut state = match manager.state.lock() {
             Ok(state) => state,
             Err(_) => return,
         };
+        // If the task was canceled or removed while `download::spawn` was preparing,
+        // terminate immediately and release the reserved slot.
+        let still_runnable = state
+            .tasks
+            .get(&id)
+            .map(|task| matches!(task.status.as_str(), "queued" | "running"))
+            .unwrap_or(false);
+        if !still_runnable {
+            state.active = state.active.saturating_sub(1);
+            drop(state);
+            download::terminate(&spawned.child);
+            download::clear_metadata(&id);
+            download::clear_log(&id);
+            schedule_pending(manager);
+            return;
+        }
         state.children.insert(id.clone(), spawned.child.clone());
-        state.active += 1;
+        let mut snap = None;
         if let Some(task) = state.tasks.get_mut(&id) {
             task.status = "running".into();
-            task.started_at = Some(download::now());
+            if task.started_at.is_none() {
+                task.started_at = Some(download::now());
+            }
+            task.ended_at = None;
+            task.error = None;
             task.command = command;
+            snap = Some(task.without_logs());
         }
-    }
-    if let Some(snapshot) = manager.snapshot(&id) {
+        snap
+    };
+    if let Some(snapshot) = started_snapshot {
         manager.emit_task(&snapshot);
     }
 
@@ -221,7 +256,7 @@ fn spawn_task(manager: Arc<DownloadManager>, id: String, payload: DownloadPayloa
         let manager = manager.clone();
         let id = id.clone();
         let running = running.clone();
-        std::thread::spawn(move || download::tail_output(manager, id, running))
+        std::thread::spawn(move || download::tail_output(manager, id, running, initial_seq))
     };
     let child = spawned.child;
 
@@ -248,6 +283,7 @@ fn spawn_task(manager: Arc<DownloadManager>, id: String, payload: DownloadPayloa
         download::clear_metadata(&id);
         // The captured output has been folded into the task log; drop the file.
         download::clear_log(&id);
+        let current_lang = settings::load(&manager.app).language;
 
         manager.update(&id, |task| {
             for (key, value) in &metadata {
@@ -286,7 +322,7 @@ fn spawn_task(manager: Arc<DownloadManager>, id: String, payload: DownloadPayloa
                 task.eta = None;
             } else {
                 task.status = "failed".into();
-                task.error = download::explain_failure(&task.logs)
+                task.error = download::explain_failure(&task.logs, &current_lang)
                     .or_else(|| Some(format!("yt-dlp exited with code {}", exit_code.unwrap_or(-1))));
             }
         });
@@ -296,36 +332,39 @@ fn spawn_task(manager: Arc<DownloadManager>, id: String, payload: DownloadPayloa
                 append_history(&manager.app, &snapshot);
             }
         }
-        finish_task(manager, id);
+        schedule_pending(manager);
     });
 }
 
-/// Start the next queued task if a slot is free. The caller must already have
-/// released its own slot.
-fn finish_task(manager: Arc<DownloadManager>, _finished: String) {
-    let next = {
+/// Fill all free concurrency slots from the pending queue while preserving
+/// existing task snapshots (created_at, partial progress, and logs on resume).
+fn schedule_pending(manager: Arc<DownloadManager>) {
+    let limit = concurrency_limit(&manager.app);
+    let mut to_start = Vec::new();
+    {
         let mut state = match manager.state.lock() {
             Ok(state) => state,
             Err(_) => return,
         };
-        if state.active >= concurrency_limit(&manager.app) {
-            return;
+        while state.active < limit {
+            let Some(queued) = state.pending.pop_front() else {
+                break;
+            };
+            let runnable = state
+                .tasks
+                .get(&queued.id)
+                .map(|task| task.status == "queued")
+                .unwrap_or(false);
+            if !runnable {
+                continue;
+            }
+            state.active += 1;
+            to_start.push((queued.id, queued.payload));
         }
-        let queued = match state.pending.pop_front() {
-            Some(queued) => queued,
-            None => return,
-        };
-        let snapshot = {
-            let settings = settings::load(&manager.app);
-            let output = effective_output_dir(&queued.payload, &settings);
-            make_snapshot(&queued.id, &queued.payload, &output)
-        };
-        state.tasks.insert(queued.id.clone(), snapshot.clone());
-        Some((queued.id, queued.payload, snapshot))
-    };
-    if let Some((id, payload, snapshot)) = next {
-        manager.emit_task(&snapshot);
-        spawn_task(manager, id, payload);
+    }
+    for (id, payload) in to_start {
+        let mgr = manager.clone();
+        std::thread::spawn(move || spawn_task(mgr, id, payload));
     }
 }
 
@@ -335,12 +374,14 @@ fn append_history(app: &AppHandle, task: &TaskSnapshot) {
         Some(entries) => entries,
         None => return,
     };
+    entries.retain(|item| item.get("id").and_then(|v| v.as_str()) != Some(task.id.as_str()));
     entries.insert(
         0,
         json!({
             "id": task.id,
             "title": task.title,
             "url": task.urls.first(),
+            "quality": task.quality,
             "destination": task.destination,
             "outputDir": task.output_dir,
             "thumbnail": task.thumbnail,
@@ -351,6 +392,7 @@ fn append_history(app: &AppHandle, task: &TaskSnapshot) {
     );
     entries.truncate(HISTORY_LIMIT);
     let _ = settings::save_history(app, &history);
+    let _ = app.emit("history-updated", &history);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,33 +400,40 @@ fn append_history(app: &AppHandle, task: &TaskSnapshot) {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-async fn analyze_url(url: String, shallow: Option<bool>) -> Result<probe::ProbeResult, String> {
+async fn analyze_url(
+    url: String,
+    shallow: Option<bool>,
+    language: Option<String>,
+) -> Result<probe::ProbeResult, String> {
     let url = url.trim().to_string();
     if url.is_empty() {
         return Err("Enter a URL first.".into());
     }
-    if download::extract_url(&url).is_none() {
+    let Some(clean_url) = download::extract_url(&url) else {
         return Err("That does not look like an http(s) link.".into());
-    }
+    };
 
     let app = APP_HANDLE.get().cloned().ok_or("App handle unavailable")?;
-    let settings = settings::load(&app);
+    let mut settings = settings::load(&app);
+    if let Some(lang) = language.filter(|value| !value.trim().is_empty()) {
+        settings.language = lang;
+    }
     let shallow = shallow.unwrap_or(false);
     let config = settings::config_dir(&app);
 
-    // yt-dlp has no cancellation handle here, so bound the wait with a channel
-    // rather than letting the webview hang forever.
-    let (sender, receiver) = std::sync::mpsc::channel();
+    // Cancel any previous in-flight UI probe so stale yt-dlp processes do not linger.
+    probe::cancel_active_probe();
+
     tauri::async_runtime::spawn_blocking(move || {
-        std::thread::spawn(move || {
-            let result = probe::analyze_with(&url, &settings, shallow, Some(&config));
-            let _ = sender.send(result);
-        });
-        match receiver.recv_timeout(PROBE_TIMEOUT) {
-        Ok(result) => Ok(result),
-        Err(_) => Ok(probe::ProbeResult::timeout()),
-        }
-    }).await.map_err(|error| error.to_string())?
+        Ok(probe::analyze_with(&clean_url, &settings, shallow, Some(&config)))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn cancel_analyze() -> bool {
+    probe::cancel_active_probe()
 }
 
 #[tauri::command]
@@ -393,25 +442,51 @@ fn get_settings(app: AppHandle) -> settings::Settings {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, mut value: settings::Settings, cookie_text: Option<String>, cookie_site: Option<String>) -> Result<settings::Settings, String> {
+fn save_settings(
+    app: AppHandle,
+    manager: State<'_, Arc<DownloadManager>>,
+    mut value: settings::Settings,
+    cookie_text: Option<String>,
+    cookie_site: Option<String>,
+) -> Result<settings::Settings, String> {
+    let cookies_dir = settings::config_dir(&app).join("cookies");
     let imported = if let Some(text) = cookie_text.filter(|text| !text.trim().is_empty()) {
-        let path = cookies::import_for_site(&text, &settings::config_dir(&app).join("cookies"), cookie_site.as_deref().unwrap_or("bilibili"), &value.cookies_file)?;
+        let path = cookies::import_for_site(
+            &text,
+            &cookies_dir,
+            cookie_site.as_deref().unwrap_or("bilibili"),
+            &value.cookies_file,
+        )?;
         value.cookies_file = path.clone();
         value.cookies_browser.clear();
         Some(path)
-    } else { None };
+    } else {
+        if value.cookies_file.trim().is_empty() {
+            cookies::remove_managed_cookies(&cookies_dir);
+        }
+        None
+    };
     if let Err(error) = settings::save(&app, &value) {
-        if let Some(path) = imported { let _ = std::fs::remove_file(path); }
+        if let Some(path) = imported {
+            let _ = std::fs::remove_file(path);
+        }
         return Err(error);
     }
+    runtime::invalidate_cache();
+    // Start queued downloads immediately if `max_concurrent_downloads` increased.
+    schedule_pending(manager.inner().clone());
     Ok(settings::load(&app))
 }
 
 #[tauri::command]
 async fn runtime_info(manager: State<'_, Arc<DownloadManager>>) -> Result<runtime::RuntimeInfo, String> {
     let config = settings::config_dir(&manager.app);
-    tauri::async_runtime::spawn_blocking(move || runtime::info_with(Some(&config)))
-        .await.map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime::invalidate_cache();
+        runtime::info_with(Some(&config))
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Query GitHub for newer yt-dlp / FFmpeg builds.
@@ -473,6 +548,7 @@ async fn install_ytdlp_update(
     .map_err(|error| format!("update failed: {error}"))?
     .map_err(|error| error.to_string())?;
 
+    runtime::invalidate_cache();
     Ok(report)
 }
 
@@ -504,6 +580,7 @@ async fn install_ffmpeg_update(
     .map_err(|error| format!("update failed: {error}"))?
     .map_err(|error| error.to_string())?;
 
+    runtime::invalidate_cache();
     Ok(report)
 }
 
@@ -561,19 +638,38 @@ fn get_history(app: AppHandle) -> serde_json::Value {
 }
 
 #[tauri::command]
-fn start_download(
-    manager: State<Arc<DownloadManager>>,
+fn clear_history(app: AppHandle) -> Result<(), String> {
+    settings::clear_history(&app)?;
+    let _ = app.emit("history-updated", serde_json::Value::Array(Vec::new()));
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_history(app: AppHandle, id: String) -> Result<bool, String> {
+    let removed = settings::remove_history_item(&app, &id)?;
+    if removed {
+        let _ = app.emit("history-updated", settings::load_history(&app));
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+async fn start_download(
+    manager: State<'_, Arc<DownloadManager>>,
     payload: DownloadPayload,
 ) -> Result<TaskSnapshot, String> {
-    enqueue(manager.inner(), payload)
+    let mgr = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || enqueue(&mgr, payload))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Re-run a finished or failed task using its original payload, so a format
 /// chosen in the analysis panel is preserved rather than falling back to the
 /// preset.
 #[tauri::command]
-fn retry_task(
-    manager: State<Arc<DownloadManager>>,
+async fn retry_task(
+    manager: State<'_, Arc<DownloadManager>>,
     id: String,
 ) -> Result<TaskSnapshot, String> {
     let payload = {
@@ -584,7 +680,10 @@ fn retry_task(
         state.payloads.get(&id).cloned()
     };
     let payload = payload.ok_or_else(|| "The original request is no longer available.".to_string())?;
-    enqueue(manager.inner(), payload)
+    let mgr = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || enqueue(&mgr, payload))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Pause keeps partial files and the original request; resume reuses its id.
@@ -620,8 +719,8 @@ fn resume_task(manager: State<Arc<DownloadManager>>, id: String) -> Result<(), S
         state.tasks.get_mut(&id).ok_or("Task no longer exists")?.status = "queued".into();
         state.pending.push_back(QueuedTask { id: id.clone(), payload });
     }
-    if let Some(snapshot) = manager.snapshot(&id) { manager.emit_task(&snapshot); }
-    finish_task(manager.inner().clone(), id);
+    if let Some(snapshot) = manager.snapshot(&id) { manager.emit_task(&snapshot.without_logs()); }
+    schedule_pending(manager.inner().clone());
     Ok(())
 }
 
@@ -667,20 +766,27 @@ fn cancel_task(manager: State<Arc<DownloadManager>>, id: String) -> Result<(), S
 }
 
 #[tauri::command]
-fn remove_task(manager: State<Arc<DownloadManager>>, id: String) -> Result<(), String> {
-    {
+fn remove_task(app: AppHandle, manager: State<Arc<DownloadManager>>, id: String) -> Result<(), String> {
+    let had_child = {
         let mut state = manager
             .state
             .lock()
             .map_err(|_| "Failed to lock task state".to_string())?;
-        if let Some(child) = state.children.get(&id).cloned() {
-            download::terminate(&child);
+        let child = state.children.get(&id).cloned();
+        if let Some(ref child) = child {
+            download::terminate(child);
         }
         state.children.remove(&id);
         state.pending.retain(|queued| queued.id != id);
         state.payloads.remove(&id);
         state.tasks.remove(&id);
+        child.is_some()
+    };
+    if !had_child {
+        download::clear_metadata(&id);
+        download::clear_log(&id);
     }
+    let _ = settings::remove_history_item(&app, &id);
     let _ = manager
         .app
         .emit("task-removed", json!({ "id": id }));
@@ -1188,7 +1294,7 @@ pub fn run() {
         std::process::exit(run_diagnose(&url));
     }
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -1201,6 +1307,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             analyze_url,
+            cancel_analyze,
             get_settings,
             save_settings,
             runtime_info,
@@ -1211,6 +1318,8 @@ pub fn run() {
             install_ffmpeg,
             list_tasks,
             get_history,
+            clear_history,
+            remove_history,
             start_download,
             retry_task,
             pause_task,
@@ -1221,6 +1330,15 @@ pub fn run() {
             reveal_path,
             copy_diagnostics
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Yuki");
+        .build(tauri::generate_context!())
+        .expect("error while building Yuki");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            probe::cancel_active_probe();
+            if let Some(manager) = app_handle.try_state::<Arc<DownloadManager>>() {
+                manager.shutdown_all();
+            }
+        }
+    });
 }

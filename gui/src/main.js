@@ -1,4 +1,4 @@
-import { createStore, storage, throttleFrame } from "./core/util.js";
+import { createStore, findUrl, storage, throttleFrame } from "./core/util.js";
 import { resolveLanguage, setLanguage, t } from "./core/i18n.js";
 import { call, isDesktop, on } from "./core/api.js";
 import { mountShell, render } from "./ui/shell.js";
@@ -10,9 +10,10 @@ const store = createStore({
   desktop: isDesktop(),
   tab: "queue",
   taskFilter: "all",
-  commandQuality: "2160",
+  commandQuality: "best",
   parserOptions: {},
   tasks: [],
+  history: [],
   probe: null,
   probeUrl: null,
   analyzing: false,
@@ -55,10 +56,23 @@ async function refreshTasks() {
   scheduleRender();
 }
 
+async function loadHistory() {
+  try {
+    const history = await call("get_history");
+    store.set({ history: Array.isArray(history) ? history : [] });
+  } catch {
+    store.set({ history: [] });
+  }
+  scheduleRender();
+}
+
 async function loadSettings() {
   try {
     const loaded = await call("get_settings");
-    store.set({ settings: loaded });
+    store.set({
+      settings: loaded,
+      commandQuality: loaded?.quality || "best",
+    });
   } catch {
     /* backend unavailable: keep whatever the preview/local defaults are */
   }
@@ -124,8 +138,11 @@ async function attachTaskEvents() {
 
     const tasks = store.get().tasks.slice();
     const index = tasks.findIndex((item) => item.id === task.id);
-    if (index >= 0) tasks[index] = task;
-    else tasks.unshift(task);
+    if (index >= 0) {
+      tasks[index] = task.logsOmitted ? { ...task, logs: tasks[index].logs || [] } : task;
+    } else {
+      tasks.unshift(task.logsOmitted ? { ...task, logs: [] } : task);
+    }
     store.set({ tasks });
     scheduleRender();
   });
@@ -139,7 +156,9 @@ async function attachTaskEvents() {
     const index = tasks.findIndex((item) => item.id === id);
     if (index < 0) return;
     const task = { ...tasks[index] };
-    const logs = task.logs ? task.logs.slice(-499) : [];
+    const existing = task.logs || [];
+    if (existing.length && existing[existing.length - 1].seq >= line.seq) return;
+    const logs = existing.length >= 500 ? existing.slice(-499) : existing.slice();
     logs.push(line);
     task.logs = logs;
     tasks[index] = task;
@@ -166,6 +185,10 @@ async function attachTaskEvents() {
     scheduleRender();
   });
 
+  await on("history-updated", () => {
+    void loadHistory();
+  });
+
   await on("update-progress", (event) => {
     store.set({ updateProgress: event.payload || null });
     scheduleRender();
@@ -183,30 +206,42 @@ function startPolling() {
   setInterval(() => {
     const active = store.get().tasks.some((task) => ["queued", "running", "merging", "pausing"].includes(task.status));
     if (active) refreshTasks();
-  }, 2500);
+  }, 8000);
 }
 
-/** Offer to fill the composer when a link is copied. */
+/** Offer to fill the composer when the window regains focus after copying a link. */
 function startClipboardWatch() {
   if (!isDesktop() || !navigator.clipboard?.readText) return;
   let last = "";
-  setInterval(async () => {
+  let busy = false;
+  const checkClipboard = async () => {
+    if (busy || document.visibilityState === "hidden") return;
     const appState = store.get();
     if (!appState.settings.clipboardWatch || appState.settingsOpen) return;
     const input = document.querySelector("[data-url-input]");
     if (!input || input.value.trim()) return;
+    busy = true;
     try {
       const text = await navigator.clipboard.readText();
       if (!text || text === last) return;
       last = text;
-      const match = text.match(/https?:\/\/[^\s<>"']+/i);
-      if (!match) return;
-      input.value = match[0];
+      const url = findUrl(text);
+      if (!url) return;
+      input.value = url;
       patchHistoryHint();
     } catch {
-      /* clipboard permission denied: nothing to do */
+      /* clipboard permission denied or unfocused: nothing to do */
+    } finally {
+      busy = false;
     }
-  }, 1600);
+  };
+  window.addEventListener("focus", () => {
+    void checkClipboard();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") void checkClipboard();
+  });
+  void checkClipboard();
 }
 
 async function boot() {
@@ -226,7 +261,7 @@ async function boot() {
   render(store.get());
   patchHistoryHint();
 
-  await Promise.all([loadEnvironment(), refreshTasks()]);
+  await Promise.all([loadEnvironment(), refreshTasks(), loadHistory()]);
   render(store.get());
 
   attachTaskEvents();

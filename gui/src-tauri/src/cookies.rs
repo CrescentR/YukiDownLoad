@@ -40,6 +40,8 @@ pub fn failure_hint(log: &str, language: &str) -> Option<String> {
     Some(message.into())
 }
 
+const MANAGED_COOKIE_FILE: &str = "managed-cookies.txt";
+
 /// Accept Netscape cookies.txt or a header explicitly scoped to its selected site.
 fn normalize_for_site(text: &str, site: &str) -> Result<String, String> {
     let text = text.trim_start_matches('\u{feff}').trim_start();
@@ -52,7 +54,7 @@ fn normalize_for_site(text: &str, site: &str) -> Result<String, String> {
             let fields: Vec<_> = line.split('\t').collect();
             if fields.len() != 7 || fields[0].is_empty() || fields[2].is_empty()
                 || !matches!(fields[1], "TRUE" | "FALSE") || !matches!(fields[3], "TRUE" | "FALSE")
-                || fields[4].parse::<u64>().is_err() || fields[5].is_empty() {
+                || fields[4].parse::<i64>().is_err() || fields[5].is_empty() {
                 return Err("Netscape Cookie 行格式不正确（需要 7 列） / Invalid Netscape cookie row".into());
             }
             rows.push(line.to_string());
@@ -84,13 +86,61 @@ fn normalize_for_site(text: &str, site: &str) -> Result<String, String> {
     Ok(format!("# Netscape HTTP Cookie File\n{}\n", rows.join("\n")))
 }
 
+/// Leniently extract valid 7-column Netscape rows from an existing cookie jar
+/// so merging another site's cookies cannot fail on unrelated comments or rows.
+fn extract_netscape_rows(text: &str) -> Vec<String> {
+    let text = text.trim_start_matches('\u{feff}');
+    let mut rows = Vec::new();
+    for line in text.lines().map(|line| line.trim_end_matches('\r')).filter(|line| !line.trim().is_empty()) {
+        if line.starts_with('#') && !line.starts_with("#HttpOnly_") {
+            continue;
+        }
+        let mut fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 7 || fields[0].is_empty() || fields[2].is_empty() || fields[5].is_empty() {
+            continue;
+        }
+        if !matches!(fields[1], "TRUE" | "FALSE") || !matches!(fields[3], "TRUE" | "FALSE") {
+            continue;
+        }
+        let expiry = if let Ok(integer) = fields[4].trim().parse::<i64>() {
+            integer.max(0).to_string()
+        } else if let Ok(float) = fields[4].trim().parse::<f64>() {
+            if !float.is_finite() { continue; }
+            (float.max(0.0) as i64).to_string()
+        } else {
+            continue;
+        };
+        fields[4] = &expiry;
+        rows.push(fields.join("\t"));
+    }
+    rows
+}
+
+fn cleanup_legacy_cookie_files(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return; };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with("cookies-") && name.ends_with(".txt"))
+            || (name.starts_with("cookies-stage-") && name.ends_with(".tmp"))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Remove all app-managed cookie files when the user clears the cookie path or resets settings.
+pub fn remove_managed_cookies(dir: &Path) {
+    let _ = fs::remove_file(dir.join(MANAGED_COOKIE_FILE));
+    cleanup_legacy_cookie_files(dir);
+}
+
 pub fn import_for_site(text: &str, dir: &Path, site: &str, existing: &str) -> Result<String, String> {
     let mut content = normalize_for_site(text, site)?;
     // Preserve cookies for other sites when adding another site's header.
     // User-supplied source files are read only; the merged jar is app-owned.
     if !existing.trim().is_empty() && Path::new(existing.trim()).is_file() {
         let previous = fs::read_to_string(existing.trim()).map_err(|_| "无法读取现有 Cookie 文件 / Could not read existing cookie file")?;
-        let previous = normalize_for_site(&previous, site)?;
         let root = |line: &str| {
             let domain = line.split('\t').next().unwrap_or("").trim_start_matches("#HttpOnly_").trim_start_matches('.');
             if domain == "bilibili.com" || domain.ends_with(".bilibili.com") { "bilibili.com".to_string() }
@@ -98,23 +148,28 @@ pub fn import_for_site(text: &str, dir: &Path, site: &str, existing: &str) -> Re
             else { domain.to_string() }
         };
         let domains: std::collections::HashSet<_> = content.lines().filter(|line| line.contains('\t')).map(root).collect();
-        for line in previous.lines().filter(|line| line.contains('\t')) {
-            if !domains.contains(&root(line)) { content.push_str(line); content.push('\n'); }
+        for line in extract_netscape_rows(&previous) {
+            if !domains.contains(&root(&line)) { content.push_str(&line); content.push('\n'); }
         }
     }
     fs::create_dir_all(dir).map_err(|_| "无法创建 Cookie 目录 / Could not create cookie directory")?;
-    let path = dir.join(format!("cookies-{}.txt", uuid::Uuid::new_v4()));
+    let stage = dir.join(format!("cookies-stage-{}.tmp", uuid::Uuid::new_v4()));
+    let target = dir.join(MANAGED_COOKIE_FILE);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
     use std::io::Write;
-    let result = options.open(&path).and_then(|mut file| file.write_all(content.as_bytes()));
+    let result = options
+        .open(&stage)
+        .and_then(|mut file| file.write_all(content.as_bytes()))
+        .and_then(|_| fs::rename(&stage, &target));
     if result.is_err() {
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&stage);
         return Err("无法保存 Cookie 文件 / Could not save cookie file".into());
     }
-    Ok(path.display().to_string())
+    cleanup_legacy_cookie_files(dir);
+    Ok(target.display().to_string())
 }
 
 #[cfg(test)]
@@ -175,17 +230,29 @@ mod tests {
     #[test]
     fn importing_another_site_keeps_existing_site_sessions_and_empty_values() {
         let dir = std::env::temp_dir().join(format!("yuki-cookie-test-{}", uuid::Uuid::new_v4()));
-        let bili = import("SESSDATA=bili-fixture", &dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        // Seed a legacy UUID cookie file to verify automatic cleanup on import.
+        fs::write(dir.join("cookies-legacy-orphan.txt"), "stale").unwrap();
+        // Seed an external Netscape jar containing a third-party cookie with float expiry and a malformed row.
+        let external = dir.join("external.txt");
+        fs::write(&external, "# Custom exporter header\n.youtube.com\tTRUE\t/\tTRUE\t1765432100.5\tSID\tyt-session\nbad-third-party-row\n").unwrap();
+        let bili = import_for_site("SESSDATA=bili-fixture", &dir, "bilibili", &external.display().to_string()).unwrap();
+        fs::remove_file(&external).unwrap();
         let combined = import_for_site("ttwid=douyin-fixture", &dir, "douyin", &bili).unwrap();
+        assert_eq!(bili, combined, "managed cookie imports must overwrite a single deterministic file");
         let content = fs::read_to_string(&combined).unwrap();
         assert!(content.contains(".bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tbili-fixture"));
         assert!(content.contains(".douyin.com\tTRUE\t/\tTRUE\t0\tttwid\tdouyin-fixture"));
+        assert!(content.contains(".youtube.com\tTRUE\t/\tTRUE\t1765432100\tSID\tyt-session"));
         let refreshed = import_for_site("ttwid=refreshed", &dir, "douyin", &combined).unwrap();
+        assert_eq!(combined, refreshed);
         let content = fs::read_to_string(&refreshed).unwrap();
         assert!(!content.contains("douyin-fixture"));
         assert!(content.contains("bili-fixture"));
         assert!(normalize_for_site("# Netscape HTTP Cookie File\n.douyin.com\tTRUE\t/\tTRUE\t0\tempty\t\n", "douyin").is_ok());
-        for path in [bili, combined, refreshed] { fs::remove_file(path).unwrap(); }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "legacy and staging files must be cleaned up");
+        remove_managed_cookies(&dir);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         fs::remove_dir(dir).unwrap();
     }
 }

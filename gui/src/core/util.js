@@ -221,12 +221,19 @@ export function sanitizeUrl(raw) {
 /** Extract the first http(s) URL from arbitrary pasted text. */
 export function findUrl(text) {
   const source = String(text ?? "");
-  const start = source.indexOf("http");
+  const start = source.search(/https?:\/\//i);
   if (start < 0) return null;
   const candidate = source.slice(start);
   const end = candidate.search(/[\s<>]/);
   const url = sanitizeUrl(end < 0 ? candidate : candidate.slice(0, end));
-  return /^https?:\/\//i.test(url) ? url : null;
+  return /^https?:\/\/\S+/i.test(url) ? url : null;
+}
+
+/** Extract every http(s) URL from multi-line or space-separated pasted text. */
+export function findUrls(text) {
+  const matches = String(text ?? "").match(/https?:\/\/[^\s<>]+/gi);
+  if (!matches) return [];
+  return matches.map((raw) => sanitizeUrl(raw)).filter((url) => /^https?:\/\/\S+/i.test(url));
 }
 
 /** Split a textarea value into individual URLs, tolerating one-per-line input. */
@@ -235,4 +242,55 @@ export function splitUrls(text) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+const PLATFORM_RULES = [
+  [/(^|\.)youtube\.com$|youtu\.be$/, "YouTube"],
+  [/(^|\.)bilibili\.com$|b23\.tv$/, "Bilibili"],
+  [/(^|\.)douyin\.com$|iesdouyin\.com$/, "Douyin"],
+  [/(^|\.)tiktok\.com$/, "TikTok"],
+  [/(^|\.)vimeo\.com$/, "Vimeo"],
+  [/(^|\.)(x|twitter)\.com$/, "X"],
+  [/(^|\.)twitch\.tv$/, "Twitch"],
+  [/(^|\.)instagram\.com$/, "Instagram"],
+  [/(^|\.)nicovideo\.jp$|nico\.ms$/, "Niconico"],
+];
+
+/** Identify a human-readable platform name (or clean hostname) from a URL. */
+export function detectPlatform(url, fallback = "") {
+  if (!url) return fallback;
+  let host = "";
+  try {
+    host = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return fallback;
+  }
+  for (const [pattern, label] of PLATFORM_RULES) {
+    if (pattern.test(host)) return label;
+  }
+  return fallback || host;
+}
+
+/** Identify a short uppercase platform badge for task cards. */
+export function detectPlatformTag(url) {
+  if (!url) return "WEB";
+  let host = "";
+  try {
+    host = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "WEB";
+  }
+  for (const [pattern, label] of PLATFORM_RULES) {
+    if (pattern.test(host)) return label.toUpperCase();
+  }
+  return "WEB";
+}
+
+/** Allow only remote http(s) thumbnails or offline SVG preview artwork. */
+export function safeImageUrl(url) {
+  const value = String(url ?? "").trim();
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("data:image/svg+xml,")) return value;
+  return "";
 }

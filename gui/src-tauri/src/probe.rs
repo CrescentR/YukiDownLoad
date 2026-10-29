@@ -6,8 +6,37 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     io::Read,
-    process::Stdio,
+    process::{Child, Stdio},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
+
+struct ActiveProbe {
+    id: u64,
+    child: Arc<Mutex<Child>>,
+    canceled: Arc<AtomicBool>,
+}
+
+static ACTIVE_PROBES: Mutex<Vec<ActiveProbe>> = Mutex::new(Vec::new());
+static NEXT_PROBE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Cancel any in-flight URL analysis and terminate its yt-dlp process tree.
+pub fn cancel_active_probe() -> bool {
+    let probes = match ACTIVE_PROBES.lock() {
+        Ok(mut guard) => std::mem::take(&mut *guard),
+        Err(_) => return false,
+    };
+    if probes.is_empty() {
+        return false;
+    }
+    for probe in probes {
+        probe.canceled.store(true, Ordering::Relaxed);
+        crate::download::terminate(&probe.child);
+    }
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,11 +128,18 @@ impl ProbeResult {
         }
     }
 
-    pub fn timeout() -> Self {
-        Self::failed(
-            "Analysis timed out. The site did not respond in time.".into(),
-            Vec::new(),
-        )
+    pub fn timeout_for(language: &str) -> Self {
+        let message = if language == "zh" {
+            "解析超时，目标站点未在规定时间内响应。"
+        } else {
+            "Analysis timed out. The site did not respond in time."
+        };
+        Self::failed(message.into(), Vec::new())
+    }
+
+    pub fn canceled_for(language: &str) -> Self {
+        let message = if language == "zh" { "解析已取消。" } else { "Analysis canceled." };
+        Self::failed(message.into(), Vec::new())
     }
 }
 
@@ -151,6 +187,23 @@ fn codec_short(codec: Option<&str>) -> Option<String> {
     Some(codec.split('.').next().unwrap_or(codec).to_string())
 }
 
+fn is_hls_protocol(protocol: Option<&str>) -> bool {
+    protocol
+        .map(|proto| proto.trim().starts_with("m3u8"))
+        .unwrap_or(false)
+}
+
+fn format_has_drm(format: &serde_json::Value) -> bool {
+    match format.get("has_drm") {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::String(text)) => {
+            let clean = text.trim();
+            !clean.is_empty() && !clean.eq_ignore_ascii_case("no") && !clean.eq_ignore_ascii_case("false")
+        }
+        _ => false,
+    }
+}
+
 /// Turn yt-dlp's raw `formats` array into a short, labelled list.
 ///
 /// The goal is a picker a human can read: merge-ready entries first, then a few
@@ -182,10 +235,61 @@ fn build_formats(info: &serde_json::Value) -> Vec<FormatOption> {
         }
     };
 
-    let mut out: Vec<FormatOption> = Vec::new();
+    let requested_ids: HashSet<String> = info
+        .get("requested_formats")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| string_of(entry, "format_id"))
+        .collect();
+
+    // Pre-scan which resolutions (and audio) already have direct HTTP(S)/DASH
+    // streams. Extractors like YouTube also emit `m3u8_native` manifest streams
+    // (e.g. visionos/web_safari format 628) with inflated peak manifest `tbr`
+    // that trigger mid-stream HTTP 403 fragment errors; drop those redundant HLS
+    // shadows only when a direct stream exists at the same resolution, so pure
+    // HLS sites keep all of their formats.
+    let mut direct_video_heights: HashSet<Option<i64>> = HashSet::new();
+    let mut has_direct_audio = false;
+    for format in raw {
+        if format_has_drm(format) || is_hls_protocol(string_of(format, "protocol").as_deref()) {
+            continue;
+        }
+        let vcodec = string_of(format, "vcodec");
+        let acodec = string_of(format, "acodec");
+        let ext = string_of(format, "ext").unwrap_or_else(|| "bin".into());
+        let has_video = vcodec
+            .as_deref()
+            .map(|codec| codec != "none" && codec != "images")
+            .unwrap_or(false);
+        let has_audio = acodec
+            .as_deref()
+            .map(|codec| codec != "none" && codec != "unknown")
+            .unwrap_or_else(|| {
+                vcodec.as_deref() == Some("none")
+                    && matches!(ext.as_str(), "wav" | "mp3" | "m4a" | "aac" | "flac" | "opus" | "ogg")
+            });
+        if has_video {
+            direct_video_heights.insert(int_of(format, "height"));
+        } else if has_audio {
+            has_direct_audio = true;
+        }
+    }
+
+    struct RankedFormat {
+        option: FormatOption,
+        is_hls: bool,
+        is_requested: bool,
+        raw_index: usize,
+    }
+
+    let mut ranked: Vec<RankedFormat> = Vec::new();
     let mut seen = HashSet::new();
 
-    for format in raw {
+    for (raw_index, format) in raw.iter().enumerate() {
+        if format_has_drm(format) {
+            continue;
+        }
         let id = match string_of(format, "format_id") {
             Some(id) => id,
             None => continue,
@@ -193,10 +297,13 @@ fn build_formats(info: &serde_json::Value) -> Vec<FormatOption> {
         let vcodec = string_of(format, "vcodec");
         let acodec = string_of(format, "acodec");
         let ext = string_of(format, "ext").unwrap_or_else(|| "bin".into());
+        if vcodec.as_deref() == Some("images") || ext == "mhtml" {
+            continue;
+        }
         let has_video = vcodec.as_deref().map(|codec| codec != "none").unwrap_or(false);
         // Generic direct audio URLs may have a known container and explicitly
         // no video, but no codec probe. Unknown is different from "none".
-        let has_audio = acodec.as_deref().map(|codec| codec != "none").unwrap_or_else(|| {
+        let has_audio = acodec.as_deref().map(|codec| codec != "none" && codec != "unknown").unwrap_or_else(|| {
             vcodec.as_deref() == Some("none")
                 && matches!(ext.as_str(), "wav" | "mp3" | "m4a" | "aac" | "flac" | "opus" | "ogg")
         });
@@ -205,6 +312,16 @@ fn build_formats(info: &serde_json::Value) -> Vec<FormatOption> {
         }
 
         let height = int_of(format, "height");
+        let is_hls = is_hls_protocol(string_of(format, "protocol").as_deref());
+        if is_hls {
+            if has_video && direct_video_heights.contains(&height) {
+                continue;
+            }
+            if !has_video && has_direct_audio {
+                continue;
+            }
+        }
+
         let resolution = string_of(format, "resolution")
             .or_else(|| height.map(|height| format!("{height}p")));
         let fps = number_of(format, "fps");
@@ -248,20 +365,26 @@ fn build_formats(info: &serde_json::Value) -> Vec<FormatOption> {
             label.push_str(&format!(" · {}", human_size(size)));
         }
 
-        out.push(FormatOption {
-            id,
-            label,
-            ext,
-            resolution,
-            height,
-            fps,
-            vcodec: codec_short(vcodec.as_deref()),
-            acodec: codec_short(acodec.as_deref()),
-            filesize,
-            tbr: number_of(format, "tbr"),
-            note,
-            recommended: false,
-            kind: kind.into(),
+        let is_requested = requested_ids.contains(&id);
+        ranked.push(RankedFormat {
+            option: FormatOption {
+                id,
+                label,
+                ext,
+                resolution,
+                height,
+                fps,
+                vcodec: codec_short(vcodec.as_deref()),
+                acodec: codec_short(acodec.as_deref()),
+                filesize,
+                tbr: number_of(format, "tbr"),
+                note,
+                recommended: false,
+                kind: kind.into(),
+            },
+            is_hls,
+            is_requested,
+            raw_index,
         });
     }
 
@@ -269,28 +392,42 @@ fn build_formats(info: &serde_json::Value) -> Vec<FormatOption> {
     // pick. An earlier version ranked "muxed" above everything else, which
     // promoted a 360p file over 1080p simply because it needed no merging.
     //
-    // Within one resolution, prefer muxed: it avoids a merge step and therefore
-    // does not require FFmpeg. Audio-only sinks to the end.
-    out.sort_by(|a, b| {
+    // Within one resolution, prefer direct HTTP(S) over HLS manifests, prefer
+    // muxed (which avoids an FFmpeg merge step), and honor yt-dlp's own
+    // `requested_formats` selection before falling back to bitrate.
+    ranked.sort_by(|a, b| {
         let rank = |item: &FormatOption| match item.kind.as_str() {
             "audio" => 1,
             _ => 0,
         };
         let muxed_first = |item: &FormatOption| if item.kind == "muxed" { 0 } else { 1 };
+        let hls_penalty = |is_hls: bool| if is_hls { 1 } else { 0 };
+        let requested_first = |req: bool| if req { 0 } else { 1 };
 
-        rank(a)
-            .cmp(&rank(b))
-            .then(b.height.unwrap_or(0).cmp(&a.height.unwrap_or(0)))
-            .then(muxed_first(a).cmp(&muxed_first(b)))
-            .then(b.fps.unwrap_or(0.0).partial_cmp(&a.fps.unwrap_or(0.0))
-                .unwrap_or(std::cmp::Ordering::Equal))
+        rank(&a.option)
+            .cmp(&rank(&b.option))
+            .then(b.option.height.unwrap_or(0).cmp(&a.option.height.unwrap_or(0)))
+            .then(hls_penalty(a.is_hls).cmp(&hls_penalty(b.is_hls)))
+            .then(muxed_first(&a.option).cmp(&muxed_first(&b.option)))
             .then(
-                b.tbr
+                b.option
+                    .fps
                     .unwrap_or(0.0)
-                    .partial_cmp(&a.tbr.unwrap_or(0.0))
+                    .partial_cmp(&a.option.fps.unwrap_or(0.0))
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
+            .then(requested_first(a.is_requested).cmp(&requested_first(b.is_requested)))
+            .then(
+                b.option
+                    .tbr
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.option.tbr.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(b.raw_index.cmp(&a.raw_index))
     });
+
+    let mut out: Vec<FormatOption> = ranked.into_iter().map(|entry| entry.option).collect();
 
     // Promote the best-ranked video entry. Fall back to whatever leads, so a
     // single audio-only result is still selectable.
@@ -352,6 +489,8 @@ fn probe_args(url: &str, settings: &crate::settings::Settings, js_runtime: Optio
     if shallow {
         // Much faster for large playlists, at the cost of per-entry metadata.
         args.push("--flat-playlist".to_string());
+    } else if settings.playlist_mode == "single" {
+        args.push("--no-playlist".to_string());
     }
     if settings.use_js_runtime {
         if let Some(runtime) = js_runtime {
@@ -407,7 +546,7 @@ pub fn analyze_with(url: &str, settings: &crate::settings::Settings, shallow: bo
     if let Err(error) = crate::cookies::check_file(&settings.cookies_file, &settings.language) {
         return ProbeResult::failed(error, Vec::new());
     }
-    let launch: Launch = runtime::resolve_with(config);
+    let launch: Launch = runtime::resolve_cached(config);
 
     // Report a launcher problem before spawning anything: the message is far
     // clearer than whatever the shell would produce.
@@ -416,13 +555,25 @@ pub fn analyze_with(url: &str, settings: &crate::settings::Settings, shallow: bo
     }
 
     let js_runtime = if settings.use_js_runtime {
-        runtime::detect_js_runtime()
+        runtime::detect_js_runtime_cached()
     } else {
         None
     };
     let args = probe_args(url, settings, js_runtime.as_deref(), shallow);
 
-    let mut child = match runtime::build_command(&launch).args(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).spawn() {
+    let mut command = runtime::build_command(&launch);
+    command
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return ProbeResult::failed(
@@ -434,22 +585,51 @@ pub fn analyze_with(url: &str, settings: &crate::settings::Settings, shallow: bo
 
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
+    let child = Arc::new(Mutex::new(child));
+    let canceled = Arc::new(AtomicBool::new(false));
+    let probe_id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut guard) = ACTIVE_PROBES.lock() {
+        guard.push(ActiveProbe {
+            id: probe_id,
+            child: child.clone(),
+            canceled: canceled.clone(),
+        });
+    }
+
     // Reading a pipe is blocking. A watchdog must own the process while the
     // reader waits, otherwise the command timeout would leave yt-dlp orphaned.
+    let wait_child = child.clone();
+    let wait_canceled = canceled.clone();
     let wait_thread = std::thread::spawn(move || {
         let started = std::time::Instant::now();
         loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Some(status),
-                Err(_) => { let _ = child.kill(); let _ = child.wait(); return None; }
-                Ok(None) => {}
+            if wait_canceled.load(Ordering::Relaxed) {
+                crate::download::terminate(&wait_child);
+                if let Ok(mut proc) = wait_child.lock() {
+                    let _ = proc.wait();
+                }
+                return (None, true);
+            }
+            let polled = wait_child.lock().ok().map(|mut proc| proc.try_wait());
+            match polled {
+                Some(Ok(Some(status))) => return (Some(status), false),
+                Some(Err(_)) | None => {
+                    crate::download::terminate(&wait_child);
+                    if let Ok(mut proc) = wait_child.lock() {
+                        let _ = proc.wait();
+                    }
+                    return (None, wait_canceled.load(Ordering::Relaxed));
+                }
+                Some(Ok(None)) => {}
             }
             if started.elapsed() > std::time::Duration::from_secs(120) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+                crate::download::terminate(&wait_child);
+                if let Ok(mut proc) = wait_child.lock() {
+                    let _ = proc.wait();
+                }
+                return (None, false);
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_millis(80));
         }
     });
 
@@ -461,18 +641,24 @@ pub fn analyze_with(url: &str, settings: &crate::settings::Settings, shallow: bo
     let stderr = stderr_thread
         .map(|handle| handle.join().unwrap_or_else(|_| Err("yt-dlp stderr reader stopped unexpectedly.".into())))
         .unwrap_or_else(|| Ok(Vec::new()));
-    let status = wait_thread.join().ok().flatten();
+    let (status, was_canceled) = wait_thread.join().ok().unwrap_or((None, false));
+    if let Ok(mut guard) = ACTIVE_PROBES.lock() {
+        guard.retain(|item| item.id != probe_id);
+    }
+    if was_canceled || canceled.load(Ordering::Relaxed) {
+        return ProbeResult::canceled_for(&settings.language);
+    }
     let succeeded = status.map(|status| status.success()).unwrap_or(false);
     let stdout = match stdout { Ok(bytes) => bytes, Err(error) => return ProbeResult::failed(error, Vec::new()) };
     let stderr = match stderr { Ok(bytes) => bytes, Err(error) => return ProbeResult::failed(error, Vec::new()) };
     let (trimmed, log) = split_output(&stdout, &stderr);
-    if status.is_none() { return ProbeResult::timeout(); }
+    if status.is_none() { return ProbeResult::timeout_for(&settings.language); }
 
     // yt-dlp writes the literal `null` and exits non-zero when extraction
     // fails, so neither signal alone is enough: check both.
     if trimmed.is_empty() || trimmed == "null" || !succeeded {
         let message = crate::cookies::failure_hint(&log.join("\n"), &settings.language)
-            .unwrap_or_else(|| diagnose_failure(&log, &launch));
+            .unwrap_or_else(|| diagnose_failure(&log, &launch, &settings.language));
         return ProbeResult::failed(message, log);
     }
 
@@ -484,7 +670,7 @@ pub fn analyze_with(url: &str, settings: &crate::settings::Settings, shallow: bo
     };
 
     if info.is_null() {
-        return ProbeResult::failed(diagnose_failure(&log, &launch), log);
+        return ProbeResult::failed(diagnose_failure(&log, &launch, &settings.language), log);
     }
     if !info.is_object() {
         return ProbeResult::failed(
@@ -587,21 +773,37 @@ pub fn analyze_with(url: &str, settings: &crate::settings::Settings, shallow: bo
 ///
 /// "No module named yt_dlp" is a *launcher* failure, not a site failure, and
 /// reporting it as the latter sends people looking in the wrong place.
-fn diagnose_failure(log: &[String], launch: &Launch) -> String {
+fn diagnose_failure(log: &[String], launch: &Launch, language: &str) -> String {
     let joined = log.join("\n");
+    let zh = language == "zh";
 
     if joined.contains("No module named yt_dlp") || joined.contains("No module named 'yt_dlp'") {
-        return format!(
-            "The Python interpreter could not import yt-dlp. Install it with `pip install yt-dlp`, \
-             or set the PYTHON environment variable to an interpreter that has it. (Tried: {})",
-            launch.runner
-        );
+        return if zh {
+            format!(
+                "Python 解释器无法导入 yt-dlp。可在「设置 → 运行环境」直接下载托管版本，或执行 `pip install yt-dlp`。（已尝试：{}）",
+                launch.runner
+            )
+        } else {
+            format!(
+                "The Python interpreter could not import yt-dlp. Install it with `pip install yt-dlp`, \
+                 or set the PYTHON environment variable to an interpreter that has it. (Tried: {})",
+                launch.runner
+            )
+        };
     }
     if joined.contains("is not recognized") || joined.contains("cannot find the file") {
-        return format!("Could not run the downloader ({}).", launch.runner);
+        return if zh {
+            format!("无法启动下载引擎（{}）。请在「设置 → 运行环境」中安装或更新 yt-dlp。", launch.runner)
+        } else {
+            format!("Could not run the downloader ({}).", launch.runner)
+        };
     }
     if joined.contains("Permission denied") {
-        return "The launcher was found but could not be executed (permission denied).".into();
+        return if zh {
+            "找到了下载引擎，但没有执行权限（Permission denied）。".into()
+        } else {
+            "The launcher was found but could not be executed (permission denied).".into()
+        };
     }
 
     // Otherwise surface the last real error yt-dlp printed.
@@ -609,7 +811,11 @@ fn diagnose_failure(log: &[String], launch: &Launch) -> String {
         .rev()
         .find(|line| line.contains("ERROR"))
         .cloned()
-        .unwrap_or_else(|| "yt-dlp returned no data for this URL.".into())
+        .unwrap_or_else(|| if zh {
+            "yt-dlp 未返回该链接的可用媒体数据。".into()
+        } else {
+            "yt-dlp returned no data for this URL.".into()
+        })
 }
 
 /// Kept as a named entry point so callers do not accidentally run analysis on
@@ -981,5 +1187,44 @@ mod tests {
     fn malformed_json_is_rejected() {
         let parsed: Result<serde_json::Value, _> = serde_json::from_str("{\"title\": ");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn youtube_direct_https_formats_beat_inflated_hls_streams() {
+        let info = serde_json::json!({
+            "requested_formats": [
+                {"format_id": "401"},
+                {"format_id": "251"}
+            ],
+            "formats": [
+                {"format_id": "sb0", "ext": "mhtml", "vcodec": "images", "acodec": "none", "protocol": "mhtml"},
+                {"format_id": "234", "ext": "mp4", "vcodec": "none", "acodec": "unknown", "protocol": "m3u8_native"},
+                {"format_id": "251", "ext": "webm", "vcodec": "none", "acodec": "opus", "tbr": 116.0, "filesize": 21654193, "protocol": "https"},
+                {"format_id": "999", "ext": "mp4", "height": 2160, "fps": 60, "vcodec": "av01.0.13M.08", "acodec": "none", "tbr": 30000.0, "protocol": "https", "has_drm": true},
+                {"format_id": "628", "ext": "mp4", "height": 2160, "fps": 60, "vcodec": "vp09.00.51.08", "acodec": "none", "tbr": 25320.662, "protocol": "m3u8_native"},
+                {"format_id": "315", "ext": "webm", "height": 2160, "fps": 60, "vcodec": "vp9", "acodec": "none", "tbr": 2517.5, "filesize": 470233088, "protocol": "https"},
+                {"format_id": "401", "ext": "mp4", "height": 2160, "fps": 60, "vcodec": "av01.0.13M.08", "acodec": "none", "tbr": 1154.9, "filesize": 215724032, "protocol": "https"}
+            ]
+        });
+
+        let formats = build_formats(&info);
+        let ids: Vec<&str> = formats.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["401", "315", "251"], "unexpected formats: {formats:?}");
+        assert!(formats[0].recommended, "yt-dlp's direct https format 401 must be recommended");
+    }
+
+    #[test]
+    fn hls_only_sites_keep_their_m3u8_formats() {
+        let info = serde_json::json!({
+            "formats": [
+                {"format_id": "hls-720", "ext": "mp4", "height": 720, "vcodec": "avc1", "acodec": "mp4a", "tbr": 2200.0, "protocol": "m3u8_native"},
+                {"format_id": "hls-1080", "ext": "mp4", "height": 1080, "vcodec": "avc1", "acodec": "mp4a", "tbr": 4500.0, "protocol": "m3u8_native"}
+            ]
+        });
+
+        let formats = build_formats(&info);
+        assert_eq!(formats.len(), 2);
+        assert_eq!(formats[0].id, "hls-1080");
+        assert!(formats[0].recommended);
     }
 }

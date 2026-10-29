@@ -1,0 +1,99 @@
+name: Yuki Release Bundles
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "yuki-v*"
+
+# Builds unsigned desktop installers and uploads them to Actions artifacts only;
+# never publishes a public GitHub Release automatically.
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Bundle (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            artifact: yuki-windows-x64-nsis
+            bundle_glob: |
+              gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+            artifact: yuki-linux-x64
+            bundle_glob: |
+              gui/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+              gui/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+            artifact: yuki-macos-arm64-dmg
+            bundle_glob: |
+              gui/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: dmg
+            artifact: yuki-macos-x64-dmg
+            bundle_glob: |
+              gui/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "gui/src-tauri -> target"
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: npm ci
+
+      - name: Verify release metadata, version parity, and notices
+        working-directory: gui
+        run: npm run check:release
+
+      - name: Build Tauri bundles
+        working-directory: gui
+        run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.bundle_glob }}
+          if-no-files-found: error
+          retention-days: 14

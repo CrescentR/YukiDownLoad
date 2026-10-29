@@ -20,7 +20,7 @@ pub struct FfmpegStatus {
 }
 
 fn command_exists(program: &str) -> bool {
-    Command::new(program)
+    crate::runtime::hidden_command(program)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -142,12 +142,7 @@ pub fn ffmpeg_status_with(config: Option<&std::path::Path>, explicit: &str) -> F
     let program = location.map(|path| {
         if path.is_dir() { path.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" }) } else { path }
     }).unwrap_or_else(|| "ffmpeg".into());
-    let mut command = Command::new(&program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    let mut command = crate::runtime::hidden_command(&program);
     match command.arg("-version").stdin(Stdio::null()).output() {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);

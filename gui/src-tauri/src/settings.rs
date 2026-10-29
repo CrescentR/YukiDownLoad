@@ -16,7 +16,7 @@ pub struct Settings {
     pub playlist_items: String,
     pub language: String,
     pub theme: String,
-    /// "ask" | "auto" | "never"
+    /// "ask" | "auto" | "single" | "all"
     pub playlist_mode: String,
     pub cookies_browser: String,
     pub cookies_file: String,
@@ -200,9 +200,30 @@ pub fn load_history(app: &tauri::AppHandle) -> serde_json::Value {
 pub fn save_history(app: &tauri::AppHandle, value: &serde_json::Value) -> Result<(), String> {
     let dir = config_dir(app);
     fs::create_dir_all(&dir).map_err(|error| format!("Failed to create config directory: {error}"))?;
+    let path = history_path(app);
     let payload =
         serde_json::to_string(value).map_err(|error| format!("Failed to encode history: {error}"))?;
-    fs::write(history_path(app), payload).map_err(|error| format!("Failed to write history: {error}"))
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, payload).map_err(|error| format!("Failed to write history: {error}"))?;
+    fs::rename(&temp, &path).map_err(|error| format!("Failed to save history: {error}"))
+}
+
+pub fn clear_history(app: &tauri::AppHandle) -> Result<(), String> {
+    save_history(app, &serde_json::Value::Array(Vec::new()))
+}
+
+pub fn remove_history_item(app: &tauri::AppHandle, id: &str) -> Result<bool, String> {
+    let mut history = load_history(app);
+    let Some(entries) = history.as_array_mut() else {
+        return Ok(false);
+    };
+    let before = entries.len();
+    entries.retain(|item| item.get("id").and_then(|v| v.as_str()) != Some(id));
+    let removed = entries.len() != before;
+    if removed {
+        save_history(app, &history)?;
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

@@ -55,9 +55,11 @@ const previewSettings = {
   outputDir: "C:/Users/Downloads",
   outputTemplate: "%(title).150s [%(id)s].%(ext)s",
   quality: "best",
+  audioFormat: "mp3",
   language: "",
   theme: "dark",
   playlistMode: "ask",
+  playlistItems: "",
   cookiesBrowser: "",
   cookiesFile: "",
   proxy: "",
@@ -87,7 +89,7 @@ function previewStub(command, args) {
       return { ...previewSettings };
     case "save_settings":
       Object.assign(previewSettings, args?.value || {});
-      if (args.cookieText?.trim()) { previewSettings.cookiesFile = '(preview)/cookies.txt'; previewSettings.cookiesBrowser = ''; }
+      if (args.cookieText?.trim()) { previewSettings.cookiesFile = '(preview)/managed-cookies.txt'; previewSettings.cookiesBrowser = ''; }
       return { ...previewSettings };
     case "runtime_info": {
       // `?runtimeProblem=1` renders the "yt-dlp not found" state so the banner
@@ -151,8 +153,14 @@ function previewStub(command, args) {
     }
     case "copy_diagnostics":
       return "Yuki diagnostics (browser preview)";
+    case "cancel_analyze":
+      return false;
     case "clear_finished":
       return [];
+    case "clear_history":
+      return null;
+    case "remove_history":
+      return false;
     default:
       throw new Error("This action needs the desktop app.");
   }

@@ -1,0 +1,83 @@
+name: Yuki CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - "gui/**"
+      - "yt_dlp/**"
+      - ".github/workflows/yuki-*.yml"
+  pull_request:
+    paths:
+      - "gui/**"
+      - "yt_dlp/**"
+      - ".github/workflows/yuki-*.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-22.04
+          - macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "gui/src-tauri -> target"
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: npm ci
+
+      - name: Check release metadata and notices
+        working-directory: gui
+        run: npm run check:release
+
+      - name: Build frontend bundle
+        working-directory: gui
+        run: npm run build:frontend
+
+      - name: Run Rust unit tests
+        working-directory: gui/src-tauri
+        run: cargo test --lib --locked

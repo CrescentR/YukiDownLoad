@@ -13,10 +13,12 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{Read, Seek, SeekFrom},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(any(unix, test))]
+use std::process::Command;
 use tauri::{AppHandle, Emitter};
 
 /// Prefix used on stdout lines carrying structured progress.
@@ -132,11 +134,46 @@ pub struct TaskSnapshot {
     pub command: Vec<String>,
     pub logs: Vec<LogLine>,
     pub dropped_logs: u64,
+    /// True on high-frequency progress ticks where `logs` are omitted from IPC.
+    #[serde(default)]
+    pub logs_omitted: bool,
 }
 
 impl TaskSnapshot {
     pub fn is_active(&self) -> bool {
         matches!(self.status.as_str(), "queued" | "running" | "merging" | "pausing" | "paused")
+    }
+
+    /// Clone metadata without cloning up to 500 log lines on every progress tick.
+    pub fn without_logs(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            urls: self.urls.clone(),
+            title: self.title.clone(),
+            status: self.status.clone(),
+            quality: self.quality.clone(),
+            output_dir: self.output_dir.clone(),
+            created_at: self.created_at,
+            started_at: self.started_at,
+            ended_at: self.ended_at,
+            exit_code: self.exit_code,
+            progress: self.progress,
+            downloaded_bytes: self.downloaded_bytes,
+            total_bytes: self.total_bytes,
+            speed: self.speed,
+            eta: self.eta,
+            fragment_index: self.fragment_index,
+            fragment_count: self.fragment_count,
+            thumbnail: self.thumbnail.clone(),
+            duration: self.duration,
+            playlist_count: self.playlist_count,
+            destination: self.destination.clone(),
+            error: self.error.clone(),
+            command: self.command.clone(),
+            logs: Vec::new(),
+            dropped_logs: self.dropped_logs,
+            logs_omitted: true,
+        }
     }
 }
 
@@ -183,6 +220,14 @@ impl DownloadManager {
         let _ = self.app.emit("task-log", serde_json::json!({ "id": id, "line": line }));
     }
 
+    /// Apply a mutation without broadcasting, returning a lightweight snapshot.
+    pub fn update_silent<F: FnOnce(&mut TaskSnapshot)>(&self, id: &str, mutate: F) -> Option<TaskSnapshot> {
+        let mut state = self.state.lock().ok()?;
+        let task = state.tasks.get_mut(id)?;
+        mutate(task);
+        Some(task.without_logs())
+    }
+
     /// Apply a mutation and broadcast the resulting snapshot.
     pub fn update<F: FnOnce(&mut TaskSnapshot)>(&self, id: &str, mutate: F) {
         let snapshot = {
@@ -205,6 +250,27 @@ impl DownloadManager {
 
     pub fn snapshot(&self, id: &str) -> Option<TaskSnapshot> {
         self.state.lock().ok()?.tasks.get(id).cloned()
+    }
+
+    /// Terminate all running child process trees and remove temporary task files on exit.
+    pub fn shutdown_all(&self) {
+        let (children, task_ids) = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            state.pending.clear();
+            let children: Vec<Arc<Mutex<Child>>> = state.children.drain().map(|(_, child)| child).collect();
+            let ids: Vec<String> = state.tasks.keys().cloned().collect();
+            (children, ids)
+        };
+        for child in &children {
+            terminate(child);
+        }
+        for id in &task_ids {
+            clear_metadata(id);
+            clear_log(id);
+        }
     }
 }
 
@@ -279,13 +345,15 @@ fn sanitize_url(raw: &str) -> String {
 /// Extract the first http(s) URL from a line, tolerating surrounding text.
 pub fn extract_url(raw: &str) -> Option<String> {
     let cleaned = sanitize_url(raw);
-    if cleaned.starts_with("http://") || cleaned.starts_with("https://") {
+    if (cleaned.starts_with("http://") || cleaned.starts_with("https://"))
+        && !cleaned.chars().any(char::is_whitespace)
+    {
         return Some(cleaned);
     }
-    let start = cleaned.find("http")?;
-    let candidate = &cleaned[start..];
+    let start = raw.find("http://").or_else(|| raw.find("https://"))?;
+    let candidate = &raw[start..];
     let end = candidate
-        .find(|character: char| character.is_whitespace())
+        .find(|character: char| character.is_whitespace() || matches!(character, '<' | '>'))
         .unwrap_or(candidate.len());
     let candidate = sanitize_url(&candidate[..end]);
     if candidate.starts_with("http://") || candidate.starts_with("https://") {
@@ -293,6 +361,24 @@ pub fn extract_url(raw: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Extract all http(s) URLs from arbitrary text (multi-line or space-separated).
+pub fn extract_urls(raw: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = raw;
+    while let Some(pos) = rest.find("http://").into_iter().chain(rest.find("https://")).min() {
+        let after = &rest[pos..];
+        let end = after
+            .find(|character: char| character.is_whitespace() || matches!(character, '<' | '>' | '"'))
+            .unwrap_or(after.len());
+        let candidate = sanitize_url(&after[..end]);
+        if (candidate.starts_with("http://") || candidate.starts_with("https://")) && candidate.len() > 8 {
+            found.push(candidate);
+        }
+        rest = &after[end..];
+    }
+    found
 }
 
 /// Path of the per-task metadata file.
@@ -394,9 +480,11 @@ pub fn build_args_with_meta(
             if line.is_empty() {
                 continue;
             }
-            match extract_url(line) {
-                Some(url) => urls.push(url),
-                None => urls.push(line.to_string()),
+            let extracted = extract_urls(line);
+            if !extracted.is_empty() {
+                urls.extend(extracted);
+            } else {
+                urls.push(line.to_string());
             }
         }
     }
@@ -417,11 +505,13 @@ pub fn build_args_with_meta(
         "--no-update".into(),
         "--continue".into(),
         // Structured progress: the single source of truth for the UI. Every
-        // field here is numeric, so it stays codepage-safe on stdout.
+        // field here is pure ASCII (numbers, status tokens, codec IDs, ext), so
+        // it stays codepage-safe on stdout while letting us ignore auxiliary
+        // subtitle/thumbnail downloads and aggregate DASH video+audio streams.
         "--progress".into(),
         "--progress-template".into(),
         format!(
-            "download:{PROGRESS_TAG}%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s"
+            "download:{PROGRESS_TAG}%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(progress.status)s|%(info.vcodec)s|%(info.acodec)s|%(info.ext)s"
         ),
     ];
 
@@ -592,11 +682,26 @@ pub fn build_args_with_meta(
         push_pair(&mut args, "--ffmpeg-location", &location);
     }
 
+    const FORBIDDEN_CUSTOM_FLAGS: [&str; 7] = [
+        "--exec",
+        "--no-exec",
+        "--exec-before-download",
+        "--plugin-dirs",
+        "--config-locations",
+        "--config-location",
+        "--alias",
+    ];
     for arg in &payload.custom_args {
         let arg = arg.trim();
-        if !arg.is_empty() {
-            args.push(arg.to_string());
+        if arg.is_empty() {
+            continue;
         }
+        for forbidden in FORBIDDEN_CUSTOM_FLAGS {
+            if arg == forbidden || arg.starts_with(&format!("{forbidden}=")) {
+                return Err(format!("Custom argument '{forbidden}' is not permitted."));
+            }
+        }
+        args.push(arg.to_string());
     }
 
     // Diagnostic escape hatch: `YUKI_DEBUG_ARGS=--verbose` (space separated)
@@ -615,8 +720,34 @@ pub fn build_args_with_meta(
     Ok((args, urls))
 }
 
+fn redact_url_userinfo(value: &str) -> String {
+    let Some(scheme_sep) = value.find("://") else {
+        return value.to_string();
+    };
+    let authority_start = scheme_sep + 3;
+    let rest = &value[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some(at_pos) = authority.rfind('@') {
+        return format!("{}********{}", &value[..authority_start], &rest[at_pos..]);
+    }
+    value.to_string()
+}
+
 fn redact(command: &[String]) -> Vec<String> {
-    const SECRET_FLAGS: [&str; 5] = ["--password", "--ap-password", "--video-password", "--cookies", "--proxy"];
+    const SECRET_FLAGS: [&str; 11] = [
+        "--password",
+        "--ap-password",
+        "--video-password",
+        "--cookies",
+        "--proxy",
+        "-u",
+        "--username",
+        "-p",
+        "--ap-username",
+        "--add-header",
+        "--add-headers",
+    ];
     let mut redact_next = false;
     command
         .iter()
@@ -634,7 +765,7 @@ fn redact(command: &[String]) -> Vec<String> {
                     return format!("{flag}=********");
                 }
             }
-            part.clone()
+            redact_url_userinfo(part)
         })
         .collect()
 }
@@ -660,7 +791,8 @@ fn parse_int(value: Option<&str>) -> Option<i64> {
 }
 
 /// Actionable guidance for the failures users actually hit.
-pub fn explain_failure(logs: &[LogLine]) -> Option<String> {
+pub fn explain_failure(logs: &[LogLine], language: &str) -> Option<String> {
+    let zh = language != "en";
     let joined = logs
         .iter()
         .rev()
@@ -668,36 +800,67 @@ pub fn explain_failure(logs: &[LogLine]) -> Option<String> {
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    if let Some(hint) = crate::cookies::failure_hint(&joined, "zh") { return Some(hint); }
+    if let Some(hint) = crate::cookies::failure_hint(&joined, language) { return Some(hint); }
     if joined.contains("Sign in to confirm") || joined.contains("not a bot") {
-        return Some(
-            "YouTube asked for a signed-in session. Open Settings and pick a browser under \"Cookies from browser\", then retry."
-                .into(),
-        );
+        return Some(if zh {
+            "YouTube 要求登录会话以完成人机验证。请在「设置 → 网络与登录」中选择已登录浏览器或导入 cookies.txt 后重试。"
+        } else {
+            "YouTube asked for a signed-in session. Open Settings and pick a browser under \"Cookies from browser\" or import cookies.txt, then retry."
+        }.into());
     }
     if joined.contains("No supported JavaScript runtime") {
-        return Some(
+        return Some(if zh {
+            "未检测到受支持的 JavaScript 运行时。请安装 Node.js 或 Deno，或在设置中启用 JS 运行时选项。"
+        } else {
             "No JavaScript runtime was found. Install Node.js or Deno, or enable the JS runtime option in Settings."
-                .into(),
-        );
+        }.into());
     }
     if joined.contains("ffmpeg") && (joined.contains("not installed") || joined.contains("not found") || joined.contains("is not recognized")) {
-        return Some("FFmpeg is required to merge this download. Install it from Settings, then retry.".into());
+        return Some(if zh {
+            "合并或转码该媒体需要 FFmpeg。请在「设置 → 运行环境」中安装 FFmpeg 后重试。"
+        } else {
+            "FFmpeg is required to merge this download. Install it from Settings, then retry."
+        }.into());
     }
     if joined.contains("HTTP Error 403") || joined.contains("Forbidden") {
-        return Some("The site refused the request (HTTP 403). Try enabling cookies from your browser in Settings.".into());
+        let is_youtube = joined.contains("[youtube]") || joined.contains("googlevideo.com");
+        return Some(if is_youtube && zh {
+            "YouTube 媒体流返回 HTTP 403（解析网页成功但音视频直链被拒）。请在「设置 → 网络与登录」中导入已登录账号的 cookies.txt（或从 Firefox 读取 Cookie），并填写固定代理地址，确保 youtube.com 与 *.googlevideo.com 走同一出口节点（避免自动负载均衡切节点或被风控的共享节点）。"
+        } else if is_youtube {
+            "YouTube media stream returned HTTP 403 (metadata parsed, but googlevideo.com refused the stream). Import a signed-in cookies.txt (or use Firefox cookies) in Settings -> Network & Auth, and set an explicit proxy so youtube.com and *.googlevideo.com share the exact same clean exit IP."
+        } else if zh {
+            "目标站点拒绝了请求（HTTP 403）。请尝试在「设置 → 网络与登录」中配置对应网站的 Cookie 或检查代理。"
+        } else {
+            "The site refused the request (HTTP 403). Try enabling cookies from your browser or importing cookies.txt in Settings."
+        }.into());
     }
     if joined.contains("Unsupported URL") {
-        return Some("This URL is not supported by the bundled extractors.".into());
+        return Some(if zh {
+            "当前引擎暂不支持该链接格式，请检查链接或在「设置 → 运行环境」更新 yt-dlp。"
+        } else {
+            "This URL is not supported by the current extractors. Check the link or update yt-dlp in Settings."
+        }.into());
     }
     if joined.contains("Private video") || joined.contains("members-only") {
-        return Some("This video is private or members-only. Sign in with browser cookies in Settings.".into());
+        return Some(if zh {
+            "该视频为私享或会员专属内容，请在「设置 → 网络与登录」配置有访问权限的账号 Cookie 后重试。"
+        } else {
+            "This video is private or members-only. Sign in with browser cookies or import cookies.txt in Settings."
+        }.into());
     }
     if joined.contains("Video unavailable") {
-        return Some("The video is unavailable, removed, or region-blocked.".into());
+        return Some(if zh {
+            "该视频当前不可用，可能已被删除或受地区限制。"
+        } else {
+            "The video is unavailable, removed, or region-blocked."
+        }.into());
     }
     if joined.contains("timed out") || joined.contains("Timeout") {
-        return Some("The connection timed out. Check your network or set a proxy in Settings.".into());
+        return Some(if zh {
+            "网络连接超时，请检查网络或在「设置 → 网络与登录」中配置代理。"
+        } else {
+            "The connection timed out. Check your network or set a proxy in Settings."
+        }.into());
     }
     // Fall back to the last ERROR line so nothing is swallowed.
     logs.iter()
@@ -725,10 +888,11 @@ pub fn terminate(child: &Arc<Mutex<Child>>) {
 
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("taskkill")
+        let _ = runtime::hidden_command("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .stdin(Stdio::null())
             .status();
     }
 
@@ -772,7 +936,7 @@ pub fn spawn(
     managed_dir: Option<&Path>,
     task_id: &str,
 ) -> Result<(SpawnedTask, Vec<String>), String> {
-    let launch: Launch = runtime::resolve_with(managed_dir);
+    let launch: Launch = runtime::resolve_cached(managed_dir);
     if let Some(problem) = &launch.problem {
         // A launcher problem is not a download failure; report it directly.
         return Err(problem.clone());
@@ -840,113 +1004,279 @@ pub fn spawn(
 
 /// Follow a task's redirected output file, feeding lines into the task state.
 ///
-/// Returns when the process has exited and the file has been drained. Lines are
-/// read incrementally by byte offset so nothing is missed or repeated.
-pub fn tail_output(manager: Arc<DownloadManager>, id: String, running: Arc<std::sync::atomic::AtomicBool>) {
+/// Returns when the process has exited and the file has been drained. Bytes are
+/// read incrementally by offset and decoded per complete line with `from_utf8_lossy`,
+/// so neither a split multi-byte UTF-8 sequence nor legacy codepage bytes can
+/// stall progress updates.
+pub fn tail_output(
+    manager: Arc<DownloadManager>,
+    id: String,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    initial_seq: u64,
+) {
     let path = log_path(&id);
     let mut offset: u64 = 0;
-    let mut remainder = String::new();
-    let mut seq: u64 = 0;
-    let mut last_emit = std::time::Instant::now();
+    let mut remainder: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut seq: u64 = initial_seq;
+    let mut last_emit = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(PROGRESS_EMIT_INTERVAL_MS as u64))
+        .unwrap_or_else(std::time::Instant::now);
+    let mut pending_progress: Option<TaskSnapshot> = None;
+    let mut progress_state = StreamProgressState::default();
+
+    let read_appended = |path: &Path, offset: &mut u64, remainder: &mut Vec<u8>, buf: &mut [u8; 8192]| -> bool {
+        let mut read_any = false;
+        if let Ok(mut file) = std::fs::File::open(path) {
+            if file.seek(SeekFrom::Start(*offset)).is_ok() {
+                loop {
+                    match file.read(buf) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            *offset += count as u64;
+                            remainder.extend_from_slice(&buf[..count]);
+                            read_any = true;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        read_any
+    };
 
     loop {
-        // Read whatever has been appended since the last pass.
-        if let Ok(mut file) = std::fs::File::open(&path) {
-            if file.seek(SeekFrom::Start(offset)).is_ok() {
-                let mut chunk = String::new();
-                if file.read_to_string(&mut chunk).is_ok() && !chunk.is_empty() {
-                    offset += chunk.len() as u64;
-                    // A partial final line is buffered until its newline arrives.
-                    remainder.push_str(&chunk);
-                    let mut lines: Vec<String> = remainder
-                        .split('\n')
-                        .map(|line| line.trim_end_matches('\r').to_string())
-                        .collect();
-                    remainder = lines.pop().unwrap_or_default();
-
-                    for line in lines {
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        if let Some(snapshot) = apply_output_line(&manager, &id, &line, &mut seq) {
-                            // Coalesce progress notifications.
-                            if last_emit.elapsed().as_millis() >= PROGRESS_EMIT_INTERVAL_MS {
-                                last_emit = std::time::Instant::now();
-                                manager.emit_task(&snapshot);
-                            }
+        if read_appended(&path, &mut offset, &mut remainder, &mut buf) {
+            while let Some(newline) = remainder.iter().position(|&byte| byte == b'\n') {
+                let mut line_bytes: Vec<u8> = remainder.drain(..=newline).collect();
+                if line_bytes.last() == Some(&b'\n') {
+                    line_bytes.pop();
+                }
+                if line_bytes.last() == Some(&b'\r') {
+                    line_bytes.pop();
+                }
+                let line = String::from_utf8_lossy(&line_bytes);
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(snapshot) = apply_output_line(&manager, &id, &line, &mut seq, &mut progress_state) {
+                    pending_progress = Some(snapshot);
+                    if last_emit.elapsed().as_millis() >= PROGRESS_EMIT_INTERVAL_MS {
+                        if let Some(snapshot) = pending_progress.take() {
+                            last_emit = std::time::Instant::now();
+                            manager.emit_task(&snapshot);
                         }
                     }
                 }
             }
         }
 
+        if pending_progress.is_some() && last_emit.elapsed().as_millis() >= PROGRESS_EMIT_INTERVAL_MS {
+            if let Some(snapshot) = pending_progress.take() {
+                last_emit = std::time::Instant::now();
+                manager.emit_task(&snapshot);
+            }
+        }
+
         if !running.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(120));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     // Drain anything written between the final read and process exit.
-    if let Ok(mut file) = std::fs::File::open(&path) {
-        if file.seek(SeekFrom::Start(offset)).is_ok() {
-            let mut chunk = String::new();
-            if file.read_to_string(&mut chunk).is_ok() {
-                remainder.push_str(&chunk);
+    read_appended(&path, &mut offset, &mut remainder, &mut buf);
+    for raw_line in remainder.split(|&byte| byte == b'\n') {
+        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let line = String::from_utf8_lossy(raw_line);
+        if !line.trim().is_empty() {
+            if let Some(snapshot) = apply_output_line(&manager, &id, &line, &mut seq, &mut progress_state) {
+                pending_progress = Some(snapshot);
             }
         }
     }
-    for line in remainder.split('\n') {
-        let line = line.trim_end_matches('\r');
-        if !line.trim().is_empty() {
-            apply_output_line(&manager, &id, line, &mut seq);
+    if let Some(snapshot) = pending_progress.take() {
+        manager.emit_task(&snapshot);
+    }
+}
+
+/// Tracks multi-stream progress within a single yt-dlp invocation so separate
+/// DASH video + audio downloads neither reset the bar mid-way nor jump to 100%
+/// before companion streams and FFmpeg post-processors finish.
+#[derive(Default, Debug, Clone)]
+struct StreamProgressState {
+    active_stream_key: Option<String>,
+    active_is_companion_audio: bool,
+    saw_video_only: bool,
+    completed_bytes: i64,
+    current_stream_bytes: i64,
+}
+
+fn has_real_codec(codec: Option<&str>) -> bool {
+    matches!(
+        codec.map(str::trim),
+        Some(value)
+            if !value.is_empty()
+                && !value.eq_ignore_ascii_case("none")
+                && !value.eq_ignore_ascii_case("na")
+                && !value.eq_ignore_ascii_case("unknown")
+    )
+}
+
+/// Subtitles (`--write-subs` / `--embed-subs`), storyboards, thumbnails and
+/// sidecar metadata go through yt-dlp's `FileDownloader` before the actual
+/// media transfer starts, emitting their own `100.0%` (`~40 KB`) progress line.
+/// Ignore those auxiliary transfers so they never overwrite media progress.
+fn is_auxiliary_download(vcodec: Option<&str>, acodec: Option<&str>, ext: Option<&str>) -> bool {
+    let Some(ext) = ext.map(|value| value.trim().to_ascii_lowercase()) else {
+        return false;
+    };
+    if matches!(
+        ext.as_str(),
+        "vtt"
+            | "srt"
+            | "ass"
+            | "ssa"
+            | "ttml"
+            | "srv1"
+            | "srv2"
+            | "srv3"
+            | "json3"
+            | "lrc"
+            | "smi"
+            | "sami"
+            | "sbv"
+            | "dfxp"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "webp"
+            | "description"
+            | "json"
+            | "mhtml"
+    ) {
+        return !has_real_codec(vcodec) && !has_real_codec(acodec);
+    }
+    false
+}
+
+fn apply_progress_payload(
+    payload: &str,
+    state: &mut StreamProgressState,
+    task: &mut TaskSnapshot,
+) -> bool {
+    let fields: Vec<&str> = payload.split('|').collect();
+    let raw_percent = parse_number(fields.first().copied());
+    let downloaded = parse_int(fields.get(1).copied());
+    let total = parse_int(fields.get(2).copied()).or_else(|| parse_int(fields.get(3).copied()));
+    let speed = parse_number(fields.get(4).copied());
+    let eta = parse_int(fields.get(5).copied());
+    let fragment_index = parse_int(fields.get(6).copied());
+    let fragment_count = parse_int(fields.get(7).copied());
+    let status = fields.get(8).copied().map(str::trim);
+    let vcodec = fields.get(9).copied().map(str::trim);
+    let acodec = fields.get(10).copied().map(str::trim);
+    let ext = fields.get(11).copied().map(str::trim);
+
+    if is_auxiliary_download(vcodec, acodec, ext) {
+        return false;
+    }
+
+    let has_codec_meta = fields.len() >= 12;
+    let has_video = has_real_codec(vcodec);
+    let has_audio = has_real_codec(acodec);
+
+    if has_codec_meta {
+        let stream_key = format!(
+            "{}|{}|{}",
+            vcodec.unwrap_or_default(),
+            acodec.unwrap_or_default(),
+            ext.unwrap_or_default()
+        );
+        if state.active_stream_key.as_deref() != Some(stream_key.as_str()) {
+            if !has_video && has_audio && state.saw_video_only {
+                // Transitioning from DASH video stream to its companion audio stream.
+                state.completed_bytes = state.completed_bytes.saturating_add(state.current_stream_bytes);
+                state.current_stream_bytes = 0;
+                state.active_is_companion_audio = true;
+            } else {
+                // Starting a primary stream (or the next item in a playlist).
+                state.completed_bytes = 0;
+                state.current_stream_bytes = 0;
+                state.active_is_companion_audio = false;
+                state.saw_video_only = has_video && !has_audio;
+            }
+            state.active_stream_key = Some(stream_key);
+        } else if has_video && !has_audio {
+            state.saw_video_only = true;
         }
     }
+
+    if let Some(bytes) = total.or(downloaded) {
+        if bytes > state.current_stream_bytes {
+            state.current_stream_bytes = bytes;
+        }
+    }
+
+    if let Some(pct) = raw_percent {
+        let clamped = pct.clamp(0.0, 100.0);
+        let scaled = if has_codec_meta && has_video && !has_audio {
+            // Reserve 90..99% for companion audio and 99..100% for FFmpeg merge/finalize.
+            (clamped * 0.90).min(90.0)
+        } else if has_codec_meta && state.active_is_companion_audio {
+            (90.0 + clamped * 0.09).min(99.0)
+        } else {
+            // Never display 100.0% while yt-dlp / post-processors are still running.
+            clamped.min(99.0)
+        };
+        task.progress = Some(scaled);
+    }
+
+    if let Some(dl) = downloaded {
+        task.downloaded_bytes = Some(state.completed_bytes.saturating_add(dl));
+    }
+    if let Some(tot) = total {
+        task.total_bytes = Some(state.completed_bytes.saturating_add(tot));
+    }
+
+    if status == Some("finished") {
+        task.speed = None;
+        task.eta = None;
+    } else {
+        if speed.is_some() {
+            task.speed = speed;
+        }
+        if eta.is_some() {
+            task.eta = eta;
+        }
+    }
+    if fragment_index.is_some() {
+        task.fragment_index = fragment_index;
+    }
+    if fragment_count.is_some() {
+        task.fragment_count = fragment_count;
+    }
+    true
 }
 
 /// Apply one captured output line: progress template, metadata, or a log entry.
 ///
-/// Returns a fresh snapshot when the line carried progress.
+/// Returns a lightweight snapshot (with `logs_omitted = true`) when the line
+/// carried progress so the caller can coalesce IPC emissions.
 fn apply_output_line(
     manager: &Arc<DownloadManager>,
     id: &str,
     text: &str,
     seq: &mut u64,
+    progress_state: &mut StreamProgressState,
 ) -> Option<TaskSnapshot> {
     // Structured progress from `--progress-template`.
     if let Some(payload) = text.trim().strip_prefix(PROGRESS_TAG) {
-        let fields: Vec<&str> = payload.split('|').collect();
-        let percent = parse_number(fields.first().copied());
-        let downloaded = parse_int(fields.get(1).copied());
-        let total = parse_int(fields.get(2).copied()).or_else(|| parse_int(fields.get(3).copied()));
-        let speed = parse_number(fields.get(4).copied());
-        let eta = parse_int(fields.get(5).copied());
-        let fragment_index = parse_int(fields.get(6).copied());
-        let fragment_count = parse_int(fields.get(7).copied());
-
-        manager.update(id, |task| {
-            if percent.is_some() {
-                task.progress = percent;
-            }
-            if downloaded.is_some() {
-                task.downloaded_bytes = downloaded;
-            }
-            if total.is_some() {
-                task.total_bytes = total;
-            }
-            if speed.is_some() {
-                task.speed = speed;
-            }
-            if eta.is_some() {
-                task.eta = eta;
-            }
-            if fragment_index.is_some() {
-                task.fragment_index = fragment_index;
-            }
-            if fragment_count.is_some() {
-                task.fragment_count = fragment_count;
-            }
+        let mut applied = false;
+        let snapshot = manager.update_silent(id, |task| {
+            applied = apply_progress_payload(payload, progress_state, task);
         });
-        return manager.snapshot(id);
+        return if applied { snapshot } else { None };
     }
 
     // Metadata normally goes to its own file, but tolerate it here too in case
@@ -956,7 +1286,7 @@ fn apply_output_line(
         let key = parts.next().unwrap_or_default().to_string();
         let value = parts.next().unwrap_or_default().trim().to_string();
         if !value.is_empty() && value != "NA" && value != "None" {
-            manager.update(id, |task| match key.as_str() {
+            if let Some(light) = manager.update_silent(id, |task| match key.as_str() {
                 "title" => task.title = value.clone(),
                 "file" => task.destination = Some(value.clone()),
                 "count" => {
@@ -969,7 +1299,9 @@ fn apply_output_line(
                 "thumb" => task.thumbnail = Some(value.clone()),
                 "duration" => task.duration = value.parse::<f64>().ok(),
                 _ => {}
-            });
+            }) {
+                manager.emit_task(&light);
+            }
         }
         return None;
     }
@@ -981,11 +1313,15 @@ fn apply_output_line(
         text: text.to_string(),
     };
 
-    // A write that failed mid-transfer is worth calling out even when yt-dlp
-    // later exits zero.
-    let merging = text.contains("[Merger]") || text.contains("[FixupM3u8]");
+    let merging = text.contains("[Merger]")
+        || text.contains("[FixupM3u8]")
+        || text.contains("[EmbedSubtitle]")
+        || text.contains("[EmbedThumbnail]")
+        || text.contains("[ExtractAudio]");
+    let retrying_error = text.contains("Got error:") && text.contains("Retrying");
+    let mut status_changed = false;
 
-    manager.update(id, |task| {
+    let updated = manager.update_silent(id, |task| {
         task.logs.push(entry.clone());
         if task.logs.len() > MAX_LOG_LINES {
             let excess = task.logs.len() - MAX_LOG_LINES;
@@ -994,8 +1330,20 @@ fn apply_output_line(
         }
         if merging && task.status == "running" {
             task.status = "merging".into();
+            task.speed = None;
+            task.eta = None;
+            status_changed = true;
+        } else if retrying_error && (task.speed.is_some() || task.eta.is_some()) {
+            task.speed = None;
+            task.eta = None;
+            status_changed = true;
         }
     });
+    if status_changed {
+        if let Some(light) = updated {
+            manager.emit_task(&light);
+        }
+    }
     manager.emit_log(id, &entry);
     None
 }
@@ -1246,19 +1594,151 @@ mod tests {
         assert_eq!(parse_number(Some("2.5MiB")), Some(2.5));
     }
 
+    fn empty_task() -> TaskSnapshot {
+        TaskSnapshot {
+            id: "test".into(),
+            urls: vec!["https://example.com/watch?v=test".into()],
+            title: "Test".into(),
+            status: "running".into(),
+            quality: "best".into(),
+            output_dir: String::new(),
+            created_at: 0.0,
+            started_at: Some(0.0),
+            ended_at: None,
+            exit_code: None,
+            progress: None,
+            downloaded_bytes: None,
+            total_bytes: None,
+            speed: None,
+            eta: None,
+            fragment_index: None,
+            fragment_count: None,
+            thumbnail: None,
+            duration: None,
+            playlist_count: None,
+            destination: None,
+            error: None,
+            command: Vec::new(),
+            logs: Vec::new(),
+            dropped_logs: 0,
+            logs_omitted: false,
+        }
+    }
+
+    #[test]
+    fn subtitle_progress_is_ignored_and_dash_streams_never_hit_100_while_running() {
+        let mut state = StreamProgressState::default();
+        let mut task = empty_task();
+
+        // 1. Subtitles (.vtt / .srt) finish at 100% (~47.8 KB) before video starts;
+        //    they must never pollute media progress, size, or speed.
+        assert!(!apply_progress_payload(
+            "100.0%|48947|48947|NA|43929.6|0|NA|NA|finished|NA|NA|vtt",
+            &mut state,
+            &mut task,
+        ));
+        assert_eq!(task.progress, None);
+        assert_eq!(task.total_bytes, None);
+        assert_eq!(task.speed, None);
+
+        // 2. DASH video-only stream scales 0..100% into 0..90%.
+        assert!(apply_progress_payload(
+            "50.0%|100000000|200000000|NA|5000000.0|20|NA|NA|downloading|av01.0.13M.08|none|mp4",
+            &mut state,
+            &mut task,
+        ));
+        assert_eq!(task.progress, Some(45.0));
+        assert_eq!(task.downloaded_bytes, Some(100_000_000));
+        assert_eq!(task.total_bytes, Some(200_000_000));
+        assert_eq!(task.speed, Some(5_000_000.0));
+
+        assert!(apply_progress_payload(
+            "100.0%|200000000|200000000|NA|5000000.0|0|NA|NA|finished|av01.0.13M.08|none|mp4",
+            &mut state,
+            &mut task,
+        ));
+        assert_eq!(task.progress, Some(90.0));
+        assert_eq!(task.speed, None, "finished stream must clear stale speed");
+        assert_eq!(task.eta, None);
+
+        // 3. Companion DASH audio stream accumulates bytes and scales into 90..99%.
+        assert!(apply_progress_payload(
+            "50.0%|10000000|20000000|NA|2000000.0|5|NA|NA|downloading|none|opus|webm",
+            &mut state,
+            &mut task,
+        ));
+        assert_eq!(task.progress, Some(94.5));
+        assert_eq!(task.downloaded_bytes, Some(210_000_000));
+        assert_eq!(task.total_bytes, Some(220_000_000));
+
+        assert!(apply_progress_payload(
+            "100.0%|20000000|20000000|NA|NA|NA|NA|NA|finished|none|opus|webm",
+            &mut state,
+            &mut task,
+        ));
+        assert_eq!(task.progress, Some(99.0));
+        assert_eq!(task.downloaded_bytes, Some(220_000_000));
+        assert_eq!(task.total_bytes, Some(220_000_000));
+
+        // 4. Single muxed stream also caps at 99.0% until process exit marks completion.
+        let mut muxed_state = StreamProgressState::default();
+        let mut muxed_task = empty_task();
+        assert!(apply_progress_payload(
+            "100.0%|50000000|50000000|NA|NA|NA|NA|NA|finished|avc1.42001E|mp4a.40.2|mp4",
+            &mut muxed_state,
+            &mut muxed_task,
+        ));
+        assert_eq!(muxed_task.progress, Some(99.0));
+    }
+
+    #[test]
+    fn youtube_403_failure_explanation_gives_targeted_cookie_and_proxy_guidance() {
+        let logs = vec![
+            LogLine { seq: 1, stream: "out".into(), text: "[youtube] KJybu1Y2tyY: Downloading webpage".into() },
+            LogLine { seq: 2, stream: "out".into(), text: "ERROR: unable to download video data: HTTP Error 403: Forbidden".into() },
+        ];
+        let zh = explain_failure(&logs, "zh-CN").expect("zh hint");
+        assert!(zh.contains("YouTube") && zh.contains("cookies.txt") && zh.contains("googlevideo.com"));
+        let en = explain_failure(&logs, "en").expect("en hint");
+        assert!(en.contains("YouTube") && en.contains("cookies.txt") && en.contains("googlevideo.com"));
+    }
+
     // -- redaction ----------------------------------------------------------
 
     #[test]
     fn secrets_are_redacted_in_both_flag_forms() {
-        let command: Vec<String> = ["yt-dlp", "--password", "hunter2", "--cookies=abc123", "--proxy", "http://user:secret@proxy.test:8080", "--format", "best"]
-            .iter()
-            .map(|part| part.to_string())
-            .collect();
+        let command: Vec<String> = [
+            "yt-dlp",
+            "--password", "hunter2",
+            "--cookies=abc123",
+            "--proxy", "http://user:secret@proxy.test:8080",
+            "--format", "best",
+            "-u", "alice",
+            "--add-header", "Cookie: SESSDATA=secret",
+            "https://user:token@example.com/private.mp4",
+        ]
+        .iter()
+        .map(|part| part.to_string())
+        .collect();
         let safe = redact(&command);
         assert_eq!(safe[2], "********");
         assert_eq!(safe[3], "--cookies=********");
         assert_eq!(safe[5], "********", "proxy credentials must not enter task logs");
         assert_eq!(safe[7], "best", "non-secret values must survive");
+        assert_eq!(safe[9], "********", "short username flags must be redacted");
+        assert_eq!(safe[11], "********", "custom headers must be redacted");
+        assert_eq!(safe[12], "https://********@example.com/private.mp4", "URL userinfo must be redacted");
+    }
+
+    #[test]
+    fn dangerous_custom_args_are_rejected_and_space_separated_urls_are_extracted() {
+        let mut bad = payload(&["https://example.com/v"]);
+        bad.custom_args = vec!["--exec".into(), "calc".into()];
+        assert!(build_args_with_ffmpeg(&bad, &Settings::default(), None, None).is_err());
+
+        let multi = payload(&["https://a.test/1 https://b.test/2\nhttps://c.test/3"]);
+        let (_, urls) = build_args_with_ffmpeg(&multi, &Settings::default(), None, None).unwrap();
+        assert_eq!(urls, vec!["https://a.test/1", "https://b.test/2", "https://c.test/3"]);
     }
 
     // -- workflow flags -----------------------------------------------------

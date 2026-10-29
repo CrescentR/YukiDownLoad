@@ -14,15 +14,61 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 /// Marker printed by the import probe so a failing `python` cannot be mistaken
 /// for a missing module.
 const PROBE_MARKER: &str = "YUKI_YTDLP_OK";
+const CACHE_TTL: Duration = Duration::from_secs(60);
 
-static RESOURCE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+#[derive(Clone, PartialEq, Eq)]
+struct CacheKey {
+    managed_dir: Option<PathBuf>,
+    yuki_bin: Option<String>,
+    studio_bin: Option<String>,
+    python_env: Option<String>,
+}
+
+struct CachedLaunch {
+    key: CacheKey,
+    resolved_at: Instant,
+    launch: Launch,
+}
+
+struct CachedJsRuntime {
+    resolved_at: Instant,
+    runtime: Option<String>,
+}
+
+static LAUNCH_CACHE: Mutex<Option<CachedLaunch>> = Mutex::new(None);
+static JS_RUNTIME_CACHE: Mutex<Option<CachedJsRuntime>> = Mutex::new(None);
 
 pub fn set_resource_dir(path: PathBuf) { let _ = RESOURCE_DIR.set(path); }
+
+/// Clear cached launcher and JS runtime lookups after dependency installs or settings changes.
+pub fn invalidate_cache() {
+    if let Ok(mut guard) = LAUNCH_CACHE.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = JS_RUNTIME_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+/// Construct a `Command` that suppresses transient console windows on Windows.
+pub fn hidden_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+}
 
 fn compat_plugin_dir() -> Option<PathBuf> {
     let mut candidates = Vec::new();
@@ -30,6 +76,7 @@ fn compat_plugin_dir() -> Option<PathBuf> {
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() { candidates.push(dir.join("yt-dlp-plugins")); }
     }
+    #[cfg(any(debug_assertions, test))]
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/yt-dlp-plugins"));
     candidates.into_iter().find(|dir| dir.join("douyin-compat/yt_dlp_plugins/extractor/yuki_douyin.py").is_file())
 }
@@ -66,11 +113,14 @@ pub struct Launch {
 }
 
 pub fn repo_root() -> PathBuf {
-    // In a dev build, CARGO_MANIFEST_DIR is <repo>/gui/src-tauri.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(parent) = manifest.parent().and_then(Path::parent) {
-        if parent.join("yt_dlp").join("__main__.py").exists() {
-            return parent.to_path_buf();
+    #[cfg(any(debug_assertions, test))]
+    {
+        // In a dev build, CARGO_MANIFEST_DIR is <repo>/gui/src-tauri.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if let Some(parent) = manifest.parent().and_then(Path::parent) {
+            if parent.join("yt_dlp").join("__main__.py").exists() {
+                return parent.to_path_buf();
+            }
         }
     }
     // Packaged builds: look next to the executable, then walk upward.
@@ -83,7 +133,7 @@ pub fn repo_root() -> PathBuf {
             dir = current.parent().map(Path::to_path_buf);
         }
     }
-    env::current_dir().unwrap_or_else(|_| manifest)
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// True when the repository ships the yt-dlp package next to this crate.
@@ -92,7 +142,7 @@ pub fn bundled_source_exists() -> bool {
 }
 
 fn first_line(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program)
+    let output = hidden_command(program)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -131,7 +181,7 @@ fn python_candidates() -> Vec<String> {
 /// Ask an interpreter whether `yt_dlp` is importable from the repo root.
 fn interpreter_has_ytdlp(program: &str, repo: &Path) -> bool {
     let script = format!("import yt_dlp; print('{PROBE_MARKER}')");
-    Command::new(program)
+    hidden_command(program)
         .args(["-c", &script])
         // PYTHONPATH mirrors what the real launch will use, so this probe is a
         // faithful test rather than an optimistic guess.
@@ -148,6 +198,7 @@ fn interpreter_has_ytdlp(program: &str, repo: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 pub fn resolve() -> Launch {
     resolve_with(None)
 }
@@ -272,51 +323,45 @@ pub fn resolve_with(managed_dir: Option<&Path>) -> Launch {
     }
 }
 
-/// Ask the launcher for its version.
-///
-/// `-U --version` makes yt-dlp report the *update channel* (e.g.
-/// `stable@2026.08.19`), which is what a version comparison needs; an older
-/// build that does not understand it still prints the plain version.
+/// Ask the launcher for its version, applying the full launcher prefix so
+/// source mode (`python -m yt_dlp`) reports yt-dlp rather than Python itself.
 fn probe_version(launch: &Launch) -> Option<String> {
-    let mut command = build_command(launch);
-    command.arg("-U").arg("--version");
-    let output = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if output.status.success() {
-        if let Some(line) = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-        {
-            return Some(line.to_string());
-        }
-    }
+    ytdlp_version(launch)
+}
 
-    // Fall back to the plain version, which needs the launcher prefix applied
-    // (a bare `python --version` would report Python's own version).
-    let mut plain = build_command(launch);
-    plain.arg("--version");
-    if let Ok(output) = plain
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .output()
-    {
-        if output.status.success() {
-            if let Some(line) = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-            {
-                return Some(line.to_string());
+/// Resolve the launcher using a short-lived cache to avoid spawning redundant
+/// interpreter probes on every queued download or URL analysis.
+pub fn resolve_cached(managed_dir: Option<&Path>) -> Launch {
+    let key = CacheKey {
+        managed_dir: managed_dir.map(Path::to_path_buf),
+        yuki_bin: env::var("YUKI_YTDLP_BIN").ok(),
+        studio_bin: env::var("YTDLP_STUDIO_BIN").ok(),
+        python_env: env::var("PYTHON").ok(),
+    };
+
+    if let Ok(guard) = LAUNCH_CACHE.lock() {
+        if let Some(cached) = guard.as_ref() {
+            let still_valid = cached.key == key
+                && cached.resolved_at.elapsed() < CACHE_TTL
+                && cached.launch.mode != "missing"
+                && (cached.launch.mode != "managed" || Path::new(&cached.launch.program).is_file());
+            if still_valid {
+                return cached.launch.clone();
             }
         }
     }
-    None
+
+    let launch = resolve_with(managed_dir);
+    if launch.mode != "missing" {
+        if let Ok(mut guard) = LAUNCH_CACHE.lock() {
+            *guard = Some(CachedLaunch {
+                key,
+                resolved_at: Instant::now(),
+                launch: launch.clone(),
+            });
+        }
+    }
+    launch
 }
 
 /// Build a `Command` for yt-dlp with the launcher prefix and environment applied.
@@ -324,12 +369,7 @@ fn probe_version(launch: &Launch) -> Option<String> {
 /// Named `build_command` rather than `command` so local `command` variables at
 /// call sites cannot shadow it.
 pub fn build_command(launch: &Launch) -> Command {
-    let mut command = Command::new(&launch.program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    let mut command = hidden_command(&launch.program);
     command.args(&launch.prefix);
     // The same adapter is used by analysis, downloads and managed executables;
     // updating yt-dlp does not discard the application compatibility layer.
@@ -393,14 +433,33 @@ pub fn detect_js_runtime() -> Option<String> {
     None
 }
 
+/// Cached JS runtime lookup so repeated task launches do not re-probe PATH.
+pub fn detect_js_runtime_cached() -> Option<String> {
+    if let Ok(guard) = JS_RUNTIME_CACHE.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.resolved_at.elapsed() < CACHE_TTL {
+                return cached.runtime.clone();
+            }
+        }
+    }
+    let runtime = detect_js_runtime();
+    if let Ok(mut guard) = JS_RUNTIME_CACHE.lock() {
+        *guard = Some(CachedJsRuntime {
+            resolved_at: Instant::now(),
+            runtime: runtime.clone(),
+        });
+    }
+    runtime
+}
+
 pub fn info_with(managed_dir: Option<&Path>) -> RuntimeInfo {
-    let launch = resolve_with(managed_dir);
+    let launch = resolve_cached(managed_dir);
     RuntimeInfo {
         mode: launch.mode.into(),
         runner: launch.runner.clone(),
         repo_root: launch.cwd.display().to_string(),
         ytdlp_version: launch.version.clone().or_else(|| ytdlp_version(&launch)),
-        js_runtime: detect_js_runtime(),
+        js_runtime: detect_js_runtime_cached(),
         problem: launch.problem.clone(),
     }
 }

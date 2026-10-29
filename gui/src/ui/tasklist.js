@@ -6,7 +6,7 @@
  * flicker and scroll position survives progress ticks.
  */
 
-import { $, escapeHtml, formatBytes, formatEta, formatSpeed, clampPercent } from "../core/util.js";
+import { $, escapeHtml, formatBytes, formatEta, formatSpeed, clampPercent, detectPlatformTag, safeImageUrl } from "../core/util.js";
 import { t } from "../core/i18n.js";
 import { icon } from "./icons.js";
 
@@ -36,8 +36,9 @@ function durationBadge(task) {
 }
 
 function thumbMarkup(task, src) {
-  if (!src) return `<div class="fallback">${icon("film", { size: 20 })}</div>`;
-  return `<img src="${escapeHtml(src)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`;
+  const safeSrc = safeImageUrl(src);
+  if (!safeSrc) return `<div class="fallback">${icon("film", { size: 20 })}</div>`;
+  return `<img src="${escapeHtml(safeSrc)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`;
 }
 
 function statsMarkup(task) {
@@ -66,7 +67,23 @@ function statsMarkup(task) {
 
   if (task.status === "queued") parts.push(`<span>${escapeHtml(task.quality || "")}</span>`);
 
-  return `<span class="task-tags"><span>${escapeHtml(task.quality==='audio'?'AUDIO':task.quality==='2160'?'4K UHD':['1080','1080p60'].includes(task.quality)?'1080p60':'VIDEO')}</span><span>${escapeHtml((task.urls?.[0]||'').includes('bilibili')?'BILIBILI':(task.urls?.[0]||'').includes('vimeo')?'VIMEO':'WEB')}</span></span>` + parts.join("");
+  const qualityTag =
+    task.quality === "audio"
+      ? "AUDIO"
+      : task.quality === "2160"
+        ? "4K UHD"
+        : task.quality === "1080p60"
+          ? "1080p60"
+          : task.quality === "1080"
+            ? "1080p"
+            : task.quality === "720"
+              ? "720p"
+              : task.quality === "480"
+                ? "480p"
+                : "VIDEO";
+  const platformTag = detectPlatformTag(task.urls?.[0] || "");
+
+  return `<span class="task-tags"><span>${escapeHtml(qualityTag)}</span><span>${escapeHtml(platformTag)}</span></span>` + parts.join("");
 }
 
 function actionsMarkup(task) {
@@ -170,7 +187,8 @@ function patchCard(node, task) {
 
   const bar = node.querySelector("[data-bar]");
   const percent = clampPercent(task.progress);
-  node.querySelector('[data-percent]').textContent=`${task.status==='completed'?'100':percent.toFixed(1)}%`;
+  const displayPercent = task.status === "completed" ? "100" : Math.min(percent, 99.9).toFixed(1);
+  node.querySelector("[data-percent]").textContent = `${displayPercent}%`;
   const indeterminate = task.status === "running" && !task.totalBytes && !task.progress;
   bar.classList.toggle("indeterminate", Boolean(indeterminate));
   if (!indeterminate) {

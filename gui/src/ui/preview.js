@@ -5,7 +5,7 @@
  * so format choice is based on real data instead of a hardcoded label.
  */
 
-import { $, escapeHtml, formatBytes, formatCount, formatDuration } from "../core/util.js";
+import { $, escapeHtml, formatBytes, formatCount, formatDuration, safeImageUrl } from "../core/util.js";
 import { t } from "../core/i18n.js";
 import { icon } from "./icons.js";
 
@@ -53,7 +53,7 @@ function formatCard(format, selectedId) {
 function headMarkup(probe) {
   const subtitle =
     probe.kind === "playlist"
-      ? t("playlistItems", probe.playlistCount || probe.entries.length)
+      ? t("playlistCountLabel", probe.playlistCount || probe.entries.length)
       : [probe.uploader, probe.duration ? formatDuration(probe.duration) : null]
           .filter(Boolean)
           .join(" · ");
@@ -76,8 +76,9 @@ function headMarkup(probe) {
     facts.push(`<span>${icon("globe", { size: 12 })}${escapeHtml(hostOf(probe.webpageUrl))}</span>`);
   }
 
-  const thumb = probe.thumbnail
-    ? `<img src="${escapeHtml(probe.thumbnail)}" alt="" referrerpolicy="no-referrer" />`
+  const thumbSrc = safeImageUrl(probe.thumbnail);
+  const thumb = thumbSrc
+    ? `<img src="${escapeHtml(thumbSrc)}" alt="" referrerpolicy="no-referrer" />`
     : `<div class="fallback" style="display:grid;width:100%;height:100%;place-items:center;color:var(--text-3)">${icon(
         "film",
         { size: 26 },
@@ -94,7 +95,7 @@ function headMarkup(probe) {
     <div class="preview-head">
       <div class="preview-thumb">${thumb}${badge}</div>
       <div class="preview-meta">
-        <h3>${escapeHtml(probe.title || "(untitled)")}</h3>
+        <h3>${escapeHtml(probe.title || t("untitled"))}</h3>
         ${subtitle ? `<div class="kv" style="margin-bottom:6px"><span>${escapeHtml(subtitle)}</span></div>` : ""}
         <div class="kv">${facts.join("")}</div>
         ${probe.log?.length ? "" : ""}
@@ -111,16 +112,16 @@ function entriesMarkup(probe) {
   const rows = entries
     .map(
       (entry, index) => `
-      <div class="entry" data-action="use-entry" data-url="${escapeHtml(entry.url || "")}" role="button" tabindex="0">
+      <button class="entry" type="button" data-action="use-entry" data-url="${escapeHtml(entry.url || "")}">
         <span class="entry-index">${index + 1}</span>
-        <span class="entry-title">${escapeHtml(entry.title)}</span>
+        <span class="entry-title">${escapeHtml(entry.title || t("untitled"))}</span>
         ${entry.durationString ? `<span class="entry-duration">${escapeHtml(entry.durationString)}</span>` : ""}
-      </div>`,
+      </button>`,
     )
     .join("");
   const more =
     probe.entries.length > entries.length
-      ? `<div class="log-note">… ${probe.entries.length - entries.length} more</div>`
+      ? `<div class="log-note">${escapeHtml(t("moreEntries", probe.entries.length - entries.length))}</div>`
       : "";
   return `<div class="entry-list">${rows}${more}</div>`;
 }
@@ -151,7 +152,7 @@ function videoBody(probe, selectedId, state) {
       </button>
       ${
         probe.subtitleLangs?.length
-          ? `<span class="chip">${probe.subtitleLangs.length} subtitle tracks</span>`
+          ? `<span class="chip">${escapeHtml(t("subtitleTracks", probe.subtitleLangs.length))}</span>`
           : ""
       }
     </div>

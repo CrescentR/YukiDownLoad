@@ -58,6 +58,8 @@ npm run dev
 npm run dev:frontend
 ```
 
+抖音兼容插件位于 `src-tauri/resources/yt-dlp-plugins/douyin-compat/yt_dlp_plugins/extractor/yuki_douyin.py`，由 Tauri 打包，并由源码引擎和应用内更新的引擎共同加载。插件沿用 yt-dlp 的视频格式解析，按浏览器详情请求传递已有会话的 UIFID；不生成 Cookie 或请求签名。站点拒绝请求时，仍需在浏览器完成验证并导入抖音 Cookie；若接口要求浏览器签名，仅导入 Cookie 可能仍无法解析。
+
 检查与测试：
 
 ```powershell
