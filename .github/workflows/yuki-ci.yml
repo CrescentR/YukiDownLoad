@@ -5,15 +5,7 @@ on:
     branches:
       - master
       - main
-    paths:
-      - "gui/**"
-      - "yt_dlp/**"
-      - ".github/workflows/yuki-*.yml"
   pull_request:
-    paths:
-      - "gui/**"
-      - "yt_dlp/**"
-      - ".github/workflows/yuki-*.yml"
   workflow_dispatch:
 
 permissions:
@@ -46,17 +38,12 @@ jobs:
             libssl-dev \
             patchelf
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: gui/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -64,20 +51,17 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "gui/src-tauri -> target"
+          workspaces: "src-tauri -> target"
 
       - name: Install frontend dependencies
-        working-directory: gui
         run: npm ci
 
       - name: Check release metadata and notices
-        working-directory: gui
         run: npm run check:release
 
       - name: Build frontend bundle
-        working-directory: gui
         run: npm run build:frontend
 
       - name: Run Rust unit tests
-        working-directory: gui/src-tauri
+        working-directory: src-tauri
         run: cargo test --lib --locked

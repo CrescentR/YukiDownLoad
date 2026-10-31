@@ -1,152 +1,44 @@
-# Config
+# Frontend & Node
+node_modules/
+dist/
+*.log
+
+# Rust & Tauri
+src-tauri/target/
+src-tauri/gen/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+*.tmp
+*.temp
+
+# Python bytecode (for bundled yt-dlp extractor plugin)
+__pycache__/
+*.pyc
+*.pyo
+
+# Local credentials & cookies
 *.conf
 cookies
 *cookies.txt
 .netrc
-
-# Downloaded
-*.annotations.xml
-*.aria2
-*.description
-*.dump
-*.frag
-*.frag.aria2
-*.frag.urls
-*.info.json
-*.live_chat.json
-*.meta
-*.part*
-*.tmp
-*.temp
-*.unknown_video
-*.ytdl
-.cache/
-
-*.3gp
-*.ape
-*.ass
-*.avi
-*.desktop
-*.f4v
-*.flac
-*.flv
-*.gif
-*.jpeg
-*.jpg
-*.lrc
-*.m4a
-*.m4v
-*.mhtml
-*.mkv
-*.mov
-*.mp3
-*.mp4
-*.mpg
-*.mpga
-*.oga
-*.ogg
-*.opus
-*.png
-!gui/src/assets/*.png
-!gui/src-tauri/icons/*.png
-!gui/public/favicon*.png
-*.sbv
-*.srt
-*.ssa
-*.swf
-*.tt
-*.ttml
-*.url
-*.vtt
-*.wav
-*.webloc
-*.webm
-*.webp
-
-# Allow config/media files in testdata
-!test/**
-
-# Python
-*.pyc
-*.pyo
-__pycache__/
-.*_cache
-wine-py2exe/
-py2exe.log
-build/
-dist/
-zip/
-tmp/
-venv/
-.venv/
-completions/
-
-# Misc
-*~
-*.DS_Store
-*.kate-swp
-MANIFEST
-test/local_parameters.json
-.coverage
-cover/
 secrets/
-updates_key.pem
-*.egg-info
-.tox
-*.class
-*.isorted
-*.stackdump
 
-# Generated
-AUTHORS
-README.txt
-.mailmap
-*.1
-*.bash-completion
-*.fish
-*.tar.gz
-*.zsh
-*.spec
-test/testdata/sigs/player-*.js
-test/testdata/thumbnails/empty.webp
-test/testdata/thumbnails/foo\ %d\ bar/foo_%d.*
-.ejs-*
+# Local test media & UI inspection screenshots
+qa-*.png
+shot.png
+app.png
+*.part*
+*.ytdl
+*.aria2
+*.info.json
 
-# Binary
-/youtube-dl
-/youtube-dlc
-/yt-dlp
-yt-dlp.zip
-*.exe
-
-# Text Editor / IDE
-.idea
+# OS & Editors
+.DS_Store
+Thumbs.db
+*~
+*.swp
+.idea/
 *.iml
-.vscode
+.vscode/
 *.sublime-*
 *.code-workspace
-*.swp
-
-# Lazy extractors
-*/extractor/lazy_extractors.py
-
-# Plugins
-ytdlp_plugins/
-yt-dlp-plugins
-# Ship the application's compatibility plugin while ignoring downloaded plugins.
-!/gui/src-tauri/resources/yt-dlp-plugins/
-!/gui/src-tauri/resources/yt-dlp-plugins/douyin-compat/
-!/gui/src-tauri/resources/yt-dlp-plugins/douyin-compat/yt_dlp_plugins/
-!/gui/src-tauri/resources/yt-dlp-plugins/douyin-compat/yt_dlp_plugins/extractor/
-!/gui/src-tauri/resources/yt-dlp-plugins/douyin-compat/yt_dlp_plugins/extractor/yuki_douyin.py
-
-# Packages
-yt_dlp_ejs/
-
-# Desktop GUI build output
-gui/node_modules/
-gui/dist/
-gui/src-tauri/target/
-gui/src-tauri/gen/
-gui/src-tauri/icons/android/
-gui/src-tauri/icons/ios/

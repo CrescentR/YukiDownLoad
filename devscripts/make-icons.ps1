@@ -9,10 +9,10 @@ Add-Type -AssemblyName System.Drawing
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-if (-not (Test-Path (Join-Path $root 'gui'))) { $root = (Get-Location).Path }
+if (-not (Test-Path (Join-Path $root 'src-tauri'))) { $root = (Get-Location).Path }
 
-$iconDir = Join-Path $root 'gui/src-tauri/icons'
-$publicDir = Join-Path $root 'gui/public'
+$iconDir = Join-Path $root 'src-tauri/icons'
+$publicDir = Join-Path $root 'public'
 New-Item -ItemType Directory -Force -Path $iconDir, $publicDir | Out-Null
 
 function New-YukiBitmap([int]$size) {

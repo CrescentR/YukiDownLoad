@@ -1,6 +1,6 @@
 * text=auto
 
-Makefile* text whitespace=-tab-in-indent
 *.sh text eol=lf
 *.md diff=markdown
+*.rs diff=rust
 *.py diff=python
