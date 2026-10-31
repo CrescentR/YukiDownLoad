@@ -116,9 +116,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          ls -la bundles
+          # Artifacts with several paths (Linux: appimage/ + deb/) keep their
+          # sub-directories, so collect the files themselves.
+          mapfile -t files < <(find bundles -type f)
+          printf '%s\n' "${files[@]}"
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" bundles/* --clobber -R "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" "${files[@]}" --clobber -R "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" bundles/* -R "$GITHUB_REPOSITORY"               --draft --verify-tag --generate-notes --title "Yuki ${TAG#yuki-v}"
+            gh release create "$TAG" "${files[@]}" -R "$GITHUB_REPOSITORY" \
+              --draft --verify-tag --generate-notes --title "Yuki ${TAG#yuki-v}"
           fi
