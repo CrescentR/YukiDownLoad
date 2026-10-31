@@ -167,7 +167,42 @@ fn python_candidates() -> Vec<String> {
         candidates.push(name.to_string());
     }
     candidates.dedup();
+    #[cfg(target_os = "macos")]
+    candidates.retain(|candidate| !is_xcode_stub(candidate));
     candidates
+}
+
+/// On macOS without the Command Line Tools, `/usr/bin/python3` is only a shim:
+/// running it pops up the "install developer tools" dialog and blocks until
+/// the user answers, and it is retried on every runtime check. Such a shim
+/// can never have yt-dlp installed, so it is skipped without being run.
+#[cfg(target_os = "macos")]
+fn is_xcode_stub(program: &str) -> bool {
+    let path = if program.contains('/') {
+        PathBuf::from(program)
+    } else {
+        let Some(found) = env::var_os("PATH").and_then(|paths| {
+            env::split_paths(&paths)
+                .map(|dir| dir.join(program))
+                .find(|candidate| candidate.is_file())
+        }) else {
+            return false;
+        };
+        found
+    };
+    if !path.starts_with("/usr/bin") {
+        return false;
+    }
+    // `xcode-select` is a real binary; `-p` fails when no developer directory
+    // (Xcode or the Command Line Tools) is installed.
+    !Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Ask an interpreter whether `yt_dlp` is installed in its Python environment.
