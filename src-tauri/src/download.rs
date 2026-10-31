@@ -894,14 +894,18 @@ pub fn terminate(child: &Arc<Mutex<Child>>) {
             .status();
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     {
-        // Negative pid targets the whole process group.
-        let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Signal the whole process group (children are spawned with
+        // `process_group(0)`, so its id is the child's pid). This calls the
+        // syscall directly: procps-ng 3.3.x's `kill -TERM -<pid>` misparses the
+        // negative pid and signals the caller too, which killed CI runners.
+        if let Ok(group) = libc::pid_t::try_from(pid) {
+            if group > 1 {
+                // SAFETY: kill(2) has no memory-safety preconditions.
+                unsafe { libc::kill(-group, libc::SIGTERM) };
+            }
+        }
     }
 
     if let Ok(mut process) = child.lock() {

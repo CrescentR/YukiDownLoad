@@ -5051,6 +5051,7 @@ dependencies = [
 name = "yuki"
 version = "0.3.4"
 dependencies = [
+ "libc",
  "regex",
  "serde",
  "serde_json",
