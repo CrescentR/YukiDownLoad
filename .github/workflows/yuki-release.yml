@@ -6,8 +6,9 @@ on:
     tags:
       - "yuki-v*"
 
-# Builds unsigned desktop installers and uploads them to Actions artifacts only;
-# never publishes a public GitHub Release automatically.
+# Builds unsigned desktop installers and uploads them as Actions artifacts.
+# A `yuki-v*` tag additionally attaches them to a *draft* GitHub Release, which
+# stays private until it is published by hand.
 permissions:
   contents: read
 
@@ -94,3 +95,30 @@ jobs:
           path: ${{ matrix.bundle_glob }}
           if-no-files-found: error
           retention-days: 14
+
+  publish:
+    name: Draft GitHub Release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/yuki-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bundles
+          merge-multiple: true
+
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -la bundles
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" bundles/* --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" bundles/* -R "$GITHUB_REPOSITORY"               --draft --verify-tag --generate-notes --title "Yuki ${TAG#yuki-v}"
+          fi
