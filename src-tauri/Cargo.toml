@@ -13,6 +13,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Diagnostic builds only: enables the Web Inspector in release bundles and
+# opens it at startup, so a blank window can be debugged on the target machine.
+devtools = ["tauri/devtools"]
+
 [dependencies]
 regex = "1"
 serde = { version = "1", features = ["derive"] }

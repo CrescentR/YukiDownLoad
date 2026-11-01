@@ -1301,6 +1301,10 @@ pub fn run() {
             let manager = Arc::new(DownloadManager::new(handle.clone()));
             let _ = APP_HANDLE.set(handle);
             app.manage(manager);
+            #[cfg(feature = "devtools")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.open_devtools();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

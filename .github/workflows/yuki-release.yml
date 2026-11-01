@@ -2,6 +2,11 @@ name: Yuki Release Bundles
 
 on:
   workflow_dispatch:
+    inputs:
+      devtools:
+        description: "Diagnostic build: enable the Web Inspector and open it at startup"
+        type: boolean
+        default: false
   push:
     tags:
       - "yuki-v*"
@@ -86,12 +91,12 @@ jobs:
         run: npm run check:release
 
       - name: Build Tauri bundles
-        run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+        run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ inputs.devtools && '--features devtools' || '' }}
 
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ matrix.artifact }}${{ inputs.devtools && '-devtools' || '' }}
           path: ${{ matrix.bundle_glob }}
           if-no-files-found: error
           retention-days: 14
