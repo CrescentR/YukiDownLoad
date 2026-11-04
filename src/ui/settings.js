@@ -497,7 +497,7 @@ export function patchSettings(state) {
               (section) => `
               <button type="button" data-action="settings-tab" data-tab="${section.id}" class="${
                 activeSection === section.id ? "active" : ""
-              }">
+              }"${activeSection === section.id ? ' aria-current="page"' : ""}>
                 ${icon(section.icon, { size: 15 })}<span>${t(section.key)}</span>
               </button>`,
             ).join("")}

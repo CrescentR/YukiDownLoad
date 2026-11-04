@@ -13,7 +13,7 @@
   check(color('.sidebar')===(light?'rgb(243, 244, 246)':'rgb(17, 18, 20)'),'Sidebar palette');
   check(color('.main')===(light?'rgb(250, 250, 250)':'rgb(22, 23, 26)'),'Canvas palette');
   check(color('.task')===(light?'rgb(255, 255, 255)':'rgb(28, 30, 34)'),'Card palette');
-  check(color('[data-action="download"]')===(light?'rgb(24, 25, 28)':'rgb(237, 237, 239)'),'Primary CTA palette');
+  check(color('[data-action="download"]')===(light?'rgb(37, 99, 235)':'rgb(142, 194, 255)'),'Primary CTA palette');
   check([...document.querySelectorAll('*')].every(node=>getComputedStyle(node).backdropFilter==='none'),'No glass effects');
   check(!document.querySelector('[data-action="queue-view"], .view-switch'),'No demo queue switch');
   check(document.querySelectorAll('.task').length===4,'Existing tasks visible automatically');

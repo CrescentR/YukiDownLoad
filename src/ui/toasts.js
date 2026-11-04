@@ -13,7 +13,7 @@ const VARIANT_ICON = {
 function host() {
   let node = $("#toasts");
   if (!node) {
-    node = el("div", { class: "toasts", id: "toasts" });
+    node = el("div", { class: "toasts", id: "toasts", role: "status", "aria-live": "polite" });
     document.body.append(node);
   }
   return node;

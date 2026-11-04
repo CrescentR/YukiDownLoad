@@ -29,11 +29,31 @@ function hostOf(url) {
   }
 }
 
+const HDR_NOTE = /HDR|HLG|DV|Dolby/i;
+
+/** Spec tags for a format: container, codecs, high frame rate, HDR and extra notes. */
+function formatTags(format) {
+  const tags = [];
+  const codec = (value) => (value && value !== "none" ? value.split(".")[0] : null);
+  if (format.ext) tags.push([format.ext.toUpperCase(), ""]);
+  for (const value of [codec(format.vcodec), codec(format.acodec)]) if (value) tags.push([value, ""]);
+  if (format.fps > 30) tags.push([`${Math.round(format.fps)}fps`, ""]);
+  const known = new Set([format.resolution, format.height ? `${format.height}p` : null].filter(Boolean));
+  for (const part of (format.note || "").split(" · ")) {
+    // Notes like "2160p60" only repeat the resolution and frame rate.
+    if (!part || known.has(part) || /^\d{3,4}p\d*$/.test(part) || (format.label || "").includes(part)) continue;
+    tags.push([part, HDR_NOTE.test(part) ? "hdr" : ""]);
+  }
+  return tags;
+}
+
 function formatCard(format, selectedId) {
   const selected = format.id === selectedId;
   const kindIcon = KIND_ICON[format.kind] || "film";
-  const codecs = [format.vcodec, format.acodec].filter(Boolean).join(" + ");
-  const meta = [format.ext?.toUpperCase(), codecs, format.note].filter(Boolean).join(" · ");
+  const tags = formatTags(format);
+  const meta = tags.length
+    ? tags.map(([text, kind]) => `<span class="format-tag ${kind}">${escapeHtml(text)}</span>`).join("")
+    : escapeHtml(format.id);
   return `
     <button class="format-card ${selected ? "selected" : ""}" type="button"
             data-action="select-format" data-format-id="${escapeHtml(format.id)}" aria-pressed="${selected}"
@@ -44,7 +64,7 @@ function formatCard(format, selectedId) {
           ${escapeHtml(format.label || format.resolution || format.id)}
           ${format.recommended ? `<span class="chip accent">${t("recommended")}</span>` : ""}
         </span>
-        <span class="format-sub">${escapeHtml(meta || format.id)}</span>
+        <span class="format-sub">${meta}</span>
       </span>
     </button>
   `;
@@ -138,10 +158,20 @@ function videoBody(probe, selectedId, state) {
   if (!probe.formats?.length) {
     return `<p class="dep-note">${t("analyzingFailed")}</p>`;
   }
+  // Video-only tracks are paired with the best audio at download time, so they
+  // group with muxed formats; audio-only tracks get their own section.
+  const groups = [
+    ["formatGroupVideo", "film", probe.formats.filter((format) => format.kind !== "audio")],
+    ["formatGroupAudio", "music", probe.formats.filter((format) => format.kind === "audio")],
+  ].filter(([, , formats]) => formats.length);
   return `
     ${qualityNotice(probe)}
-    <div class="format-grid">
-      ${probe.formats.map((format) => formatCard(format, selectedId)).join("")}
+    <div class="format-groups">
+      ${groups.map(([key, glyph, formats]) => `
+        <section class="format-group">
+          <h4 class="format-group-title">${icon(glyph, { size: 12 })}<span>${t(key)}</span><span class="format-group-count">${formats.length}</span></h4>
+          <div class="format-grid">${formats.map((format) => formatCard(format, selectedId)).join("")}</div>
+        </section>`).join("")}
     </div>
     <div class="parser-extras"><div class="eyebrow">${t('embedOptions')}</div>
       ${[['embedSubtitles','embedSubtitles'],['embedThumbnail','embedThumbnail']].map(([key,label])=>`<label class="parser-check"><input type="checkbox" data-parser-option="${key}" ${(state.parserOptions?.[key] ?? state.settings[key])?'checked':''}/> <span>${t(label)}</span></label>`).join('')}
@@ -236,7 +266,7 @@ export function patchPreview(state) {
 
   const sig = [signature(state),state.analyzing,state.parserOpen,JSON.stringify(state.parserOptions)].join('|');
   if (host.dataset.sig === sig) return;
-  const scrollTop = host.querySelector('.format-grid')?.scrollTop || 0;
+  const scrollTop = host.querySelector('.format-groups')?.scrollTop || 0;
   const focusKey = host.contains(document.activeElement) ? document.activeElement.dataset.parserOption : null;
   host.dataset.sig = sig;
 
@@ -245,7 +275,7 @@ export function patchPreview(state) {
     : !probe.ok ? errorMarkup(probe, state.settings)
     : `${headMarkup(probe)}<div class="preview-body">${probe.kind === 'playlist' ? playlistBody(probe) : videoBody(probe,state.selectedFormatId,state)}</div>`;
   host.innerHTML = `<div class="parser-scrim"><section class="preview parser-dialog" role="dialog" aria-modal="true" aria-labelledby="parser-title"><header class="parser-title"><div><div class="eyebrow">${t('parserTitle')}</div><h2 id="parser-title">${t('chooseFormat')}</h2><p>${t('parserHint')}</p></div><button class="btn icon ghost" data-action="dismiss-preview" aria-label="${t('close')}">${icon('x',{size:15})}</button></header>${body}</section></div>`;
-  const grid=host.querySelector('.format-grid'); if(grid) grid.scrollTop=scrollTop;
+  const groups=host.querySelector('.format-groups'); if(groups) groups.scrollTop=scrollTop;
   if(focusKey) host.querySelector(`[data-parser-option="${focusKey}"]`)?.focus({preventScroll:true});
   else if (!host.contains(document.activeElement)) host.querySelector('button')?.focus({preventScroll:true});
 }

@@ -124,7 +124,7 @@ export function libraryTasks(state) {
 export function patchNav(state) {
   const allLibrary = libraryTasks(state);
   const counts={queue:state.tasks.filter(task=>!['completed','canceled'].includes(task.status)).length,library:allLibrary.length,completed:allLibrary.filter(task=>task.status==='completed').length};
-  document.querySelectorAll('[data-nav] .nav-item').forEach(button=>{button.classList.toggle('active',state.tab===button.dataset.tab);button.querySelector('.nav-count').textContent=counts[button.dataset.tab];});
+  document.querySelectorAll('[data-nav] .nav-item').forEach(button=>{const active=state.tab===button.dataset.tab;button.classList.toggle('active',active);if(active)button.setAttribute('aria-current','page');else button.removeAttribute('aria-current');button.querySelector('.nav-count').textContent=counts[button.dataset.tab];});
 }
 export function visibleTasks(state) {
   const pool = state.tab === 'queue' ? state.tasks : libraryTasks(state);
