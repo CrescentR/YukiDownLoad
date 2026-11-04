@@ -107,7 +107,9 @@ fn normalize_for_site(text: &str, site: &str) -> Result<String, String> {
         if header.chars().any(|ch| ch.is_control()) { return Err("请只粘贴 Cookie 请求头的值 / Paste only the Cookie request header value".into()); }
         let mut session = false;
         for pair in header.split(';').map(str::trim).filter(|pair| !pair.is_empty()) {
-            let (name, value) = pair.split_once('=').ok_or("Cookie 格式应为 name=value; name=value / Invalid Cookie header")?;
+            // Copied headers can hold bare tokens such as `douyin.com`; they set
+            // no cookie, so skip them rather than reject the whole header.
+            let Some((name, value)) = pair.split_once('=') else { continue };
             let name = name.trim();
             if name.is_empty() || !name.bytes().all(|ch| ch.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&ch)) {
                 return Err("Cookie 名称无效 / Invalid cookie name".into());
@@ -317,6 +319,9 @@ mod tests {
         let text = normalize_for_site("ttwid=visitor; __ac_nonce=nonce", "douyin").unwrap();
         assert!(text.contains(".douyin.com\tTRUE\t/\tTRUE\t0\tttwid\tvisitor"));
         assert!(!text.contains("bilibili.com"));
+        let bare = normalize_for_site("ttwid=visitor; douyin.com; UIFID=fixture", "douyin").unwrap();
+        assert!(bare.contains("\tUIFID\tfixture") && !bare.contains("\tdouyin.com\t"));
+        assert!(normalize_for_site("douyin.com", "douyin").is_err());
         assert!(normalize_for_site("SESSDATA=bili-token; ttwid=visitor", "douyin").is_err());
         assert!(normalize_for_site("ttwid=visitor", "bilibili").is_err());
         assert!(failure_hint("ERROR: [Douyin] Fresh cookies (not necessarily logged in) are needed", "zh").unwrap().contains("B 站 Cookie 无法用于抖音"));
